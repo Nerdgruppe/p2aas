@@ -1,0 +1,71 @@
+CON
+    F_CPU   = 200_000_000
+    BAUD    =     115_200
+
+    TXD_PIN = 62
+    RXD_PIN = 63
+
+    UART_CLOCKS = F_CPU / BAUD
+
+    UART_CFG = (F_CPU / BAUD * $1_0000) | (8-1) ' 115200 @ 8 bit
+
+DAT
+        ''  %0000_000E_DDDD_DDMM_MMMM_MMMM_PPPP_CCSS
+        '' 0b0000_0001_0000_0000_0000_1001_1111_1011
+        ''           E                               = "PLL on"
+        ''             DDDD_DD                       = xi div:  1
+        ''                    MM_MMMM_MMMM           = vco mul: 10
+        ''                                 PPPP      = "VCO / 1"
+        ''                                      CC   = "15pF per pin"
+        ''                                        SS = clk:PLL
+        '' => "CLK = XI * 20 with PLL enabled"
+        hubset ##16779771 '' _clkmode = 0x10009FB = 200 MHz
+    
+        WRPIN #P_TT_01 | P_ASYNC_TX, #TXD_PIN
+        WRPIN #P_TT_00 | P_ASYNC_RX, #RXD_PIN
+
+        WXPIN ##UART_CFG, #TXD_PIN
+        WXPIN ##UART_CFG, #RXD_PIN
+
+        '' enable smart pin
+        DIRH #TXD_PIN
+        DIRH #RXD_PIN
+
+        WAITX ##10_000_000
+
+        ' First write must be without the "wait busy" logic as the pin would never trigger this!
+        ' Write the "start of execution marker":
+        WYPIN #"!", #TXD_PIN 
+
+main_loop
+        TESTP   #RXD_PIN WC
+IF_NC   JMP     #main_loop
+
+        RDPIN   rt_tmp0, #RXD_PIN       ' read received word
+        SHR     rt_tmp0, #32-8          ' right-justify it
+
+        CALLPA  rt_tmp0, #rt_write_byte ' and echo back
+
+        JMP     #main_loop
+
+rt_write_hex_long ' (chr: PB)
+        MOV     rt_tmp0, #8
+  .nib_loop
+        GETNIB  rt_tmp1, PB, #7
+        CMP     rt_tmp1, #10    WCZ
+IF_GE   ADD     rt_tmp1, #"A"-10
+IF_LT   ADD     rt_tmp1, #"0"
+        CALLPA  rt_tmp1, #rt_write_byte
+        SHL     PB, #4
+        DJNZ    rt_tmp0, #.nib_loop
+        RET
+
+rt_write_byte ' (chr: PA)
+        TESTP   #TXD_PIN        WC      ' wait for empty buffer
+IF_NC   JMP     #rt_write_byte          ' if not empty, test again
+_RET_   WYPIN   PA, #TXD_PIN            ' write PA
+
+rt_tmp0     long 0
+rt_tmp1     long 0
+
+
