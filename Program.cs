@@ -85,31 +85,41 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
     using var socket = webSocketContext.WebSocket;
     using var userCodeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-
+    var sw = Stopwatch.StartNew();
+    var uploadStamp = TimeSpan.Zero;
+    var exitReason = "not started";
 
     var uploadError = false;
     try
     {
         var payload = await ReadPayload(socket, receiveBuffer, cancellationToken);
 
+        Console.Error.WriteLine("Uploading {0} bytes from {1}...", payload.Length, context.Request.RemoteEndPoint);
+
         uploadError = true;
         await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, cancellationToken);
         uploadError = false;
 
+        uploadStamp = sw.Elapsed;
+
         userCodeTimeout.CancelAfter(requestOptions.UserCodeTimeout);
         await BridgeSocketAndSerial(socket, userCodeTimeout.Token);
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
+
+        exitReason = "completed";
     }
     catch (ProtocolViolationException ex)
     {
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.ProtocolError, ex.Message, CancellationToken.None);
         // Do not rethrow here, this is an expected case.
+        exitReason = $"protocol violation: {ex.Message}";
     }
     catch (OperationCanceledException) when (userCodeTimeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
     {
         Debug.Assert(!uploadError);
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left for user code.", CancellationToken.None);
         // Do not rethrow here, this is an expected case.
+        exitReason = "user timeout";
     }
     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
@@ -123,18 +133,30 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
         {
             // Do not rethrow here, this is an expected case:
             await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left.", CancellationToken.None);
+
+            exitReason = "global timeout";
         }
     }
     catch (WebSocketException ex)
     {
         Console.Error.WriteLine("WebSocket closed unexpectedly: {0}", ex.Message);
         // Do not rethrow here, this is an expected case.
+        exitReason = $"web socket error: {ex.Message}";
     }
     catch (Exception)
     {
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", CancellationToken.None);
         throw;
     }
+
+    var endTime = sw.Elapsed;
+
+    Console.Error.WriteLine(
+        "  {0} ms upload time, {1} ms execution time, {2}",
+        uploadStamp.TotalMilliseconds,
+        (endTime - uploadStamp).TotalMilliseconds,
+        exitReason
+    );
 }
 
 async Task<SerialPortProxy> OpenSerialPort(string portName)
