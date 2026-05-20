@@ -1,0 +1,180 @@
+HOST COMMUNICATION
+
+Normally the boot process loads a user's pre-written Propeller 2 Application and immediately executes it; however,
+the boot process also enables a host system to either download a new Propeller application or to begin an
+interactive session with the Propeller 2's built-in systems. Most boot patterns (dictated by pins P59-P61) feature
+a serial communication window. While configured with one of these boot patterns, a host computer's
+development software (such as Propeller Tool) can download new code, or instead, the user can initiate
+interactive mode.
+
+Download Propeller Application
+During the boot process's serial communication window, the Propeller 2 can be loaded via asynchronous serial
+stream into P63, configured as 8 data bits, no parity, 1 stop bit, 9,600 to 2,000,000 baud. The signal should be
+inverted; start bit is low, stop bit is high, and data bits are high for 0 and low for 1.
+The boot loader (or loader, for short) automatically adapts to the sender's baud rate from every greater-than ">"
+character ($3E) it receives. It is necessary to initially send "> " (greater-than, space; $3E, $20) before the first
+command, and then use ">" characters periodically throughout the data to keep the baud rate tightly calibrated to
+the internal RC oscillator that the loader uses during the boot process. Received ">" characters are not passed to
+the command parser, so they can be placed anywhere.
+The loader's response messages are sent back serially over P62 at the same baud rate that the sender used. P62
+is normally driven continuously during the serial protocol, but will go into open-drain mode when either the INA or
+INB mask of a command is non-0 (for multiprogramming).
+Unless forbidden by the Boot Pattern or preempted by a program in an SPI memory chip, the serial loader
+becomes active within 15ms of reset being released.
+Whitespace is required between command keywords and data. Each of the following characters, individually or in
+groups of any contiguous combination, constitute a single whitespace:
+
+    Whitespace Characters in Serial Loading Protocol
+    TAB ($09), LF ($0A), CR ($0D), SPACE ($20), = ($3D)¹
+
+¹: The equal sign "=" may be present as padding in Base64 data
+
+There are four commands which the sender can issue:
+
+Serial Loading Protocol Commands
+
+    Request Propeller Type
+        Prop_Chk <INAmask> <INAdata> <INBmask> <INBdata>
+    Change Clock Setting
+        Prop_Clk <INAmask> <INAdata> <INBmask> <INBdata> <HUBSETclocksetting>
+    Load and Execute Hex Data, With and Without Checksum Verification
+        Prop_Hex <INAmask> <INAdata> <INBmask> <INBdata> <hexdatabytes> ?
+        Prop_Hex <INAmask> <INAdata> <INBmask> <INBdata> <hexdatabytes> ~
+    Load and Execute Base64 Data, With and Without Checksum Verification
+        Prop_Txt <INAmask> <INAdata> <INBmask> <INBdata> <base64chrs> ?
+        Prop_Txt <INAmask> <INAdata> <INBmask> <INBdata> <base64chrs> ~
+
+Each command keyword is followed by a Propeller 2 chip identifier in the form of four 32-bit hex values. The
+normal case is to use zeros for each of these fields to talk to any and all chips that are connected; often a single
+Propeller 2 chip.
+
+Multiprogramming
+
+If multiple Propeller 2 chips are being loaded from the same serial line, it is often desirable to differentiate each
+Propeller's download by unique ID (their individual INA and INB states in the circuit). The Propeller 2's loader
+automatically ignores commands whose ID (INA / INB data and mask values) does not match its own INA and
+INB ports. All ID patterns are valid using pins P2 and beyond— the loader can not see the state of P0 and P1
+since it configures them as smart pins monitoring their logical neighbor, P63, for automatic baud detection.
+
+Loader Parsing Notes
+
+While waiting for a new command, Base64 data destined for another chip is safely ignored due to the fact that
+each command keyword contains an underscore "_"; an illegal character in Base64.
+If a character is received which does not fit expectations for that moment (ex: an "x" is received when hex digits
+are expected), the loader aborts the current command and waits for a new command.
+
+Prop_Chk
+
+Use the Prop_Chk command to verify Propeller 2 connection and retrieve its version.
+The response is in the form CR+LF+"Prop_Ver"+SPACE+<version_character>+CR+LF where <version_character>
+is "A".."Z" and indicates the version of Propeller 2. The Rev B/C silicon responds with "G":
+
+    Sender:"> Prop_Chk 0 0 0 0"+CR
+    Loader:CR+LF+"Prop_Ver G"+CR+LF
+
+Prop_Clk
+
+Use the Prop_Clk command to update the P2's clock source. This is similar to executing the PASM instruction:
+HUBSET ##$0xxxxxxx.
+
+The response to a valid Prop_Clk command is a period "." character, then it performs the following steps:
+1. Switches to the internal 20 MHz (fast) clock
+2. Sets the desired configuration (except mode)
+3. Waits ≈5 ms for the clock hardware to settle to the new configuration
+4. Enables the desired clock mode
+
+NOTE: After issuing the command, the sender should wait an additional 10ms, then send the "> " ($3E,
+$20) auto-baud sequence to adjust for the new clock configuration.
+NOTE: If an image is loaded (see Prop_Hex/Prop_Txt) after switching to a PLL clock mode that is different
+than the mode used by that image, the uploaded image may need to issue a "HUBSET #$F0" before
+switching to the desired clock mode. See the warning in Configuring the Clock Generator for more details.
+An alternative approach is to use the same clock configuration as used by the image. This means that
+the image's call to HUBSET will effectively be a NOP, but always safe to perform.
+
+Example: Set PLL to 148.5 MHz
+
+To update the clock source as calculated in the PLL Example:
+    Sender:"> Prop_Clk 0 0 0 0 19D28F8"+CR
+    Loader:"."
+    Sender:(wait ≈10ms)
+    Sender:"> Prop_Clk 0 0 0 0 19D28FB"+CR
+    Loader:"."
+NOTE: An initial "Prop_Clk 0 0 0 0 F0" is not required since the clock circuit starts up in this mode.
+
+Example: Reset to Boot Clock Configuration
+To return to the clock configuration on bootup:
+    Sender:"> Prop_Clk 0 0 0 0 F0"+CR
+    Loader:"."
+
+Prop_Hex
+
+Use the Prop_Hex command to load code into Hub RAM, starting at $00000, and then execute it. The code must
+be sent as a stream of ASCII text representing bytes in hex format, separated by whitespace. Only the lower 8 bits
+of each value is used.
+If the Prop_Hex command is terminated with a "?" character, the loader will verify the checksum and respond
+before attempting to run the code. The loader responds with a period "." if the checksum was valid, or an
+exclamation point "!" if the checksum was invalid. When valid, the booter will perform a COGINIT #0,#0
+instruction to relaunch cog 0 (currently running the loader program) with the new program starting at $00000.
+When invalid, the booter will wait for another command.
+If the Prop_Hex command is terminated with a "~" character, the loader will relaunch cog 0 to run the new
+program at $00000; skipping the validation and response steps noted above.
+Example: Loading a small program:
+
+Consider this small program:
+    DAT
+        .lp
+    ORG
+        not   dirb           'all outputs
+        not   outb           'toggle states (blinks leds on Prop123 & P2 Eval boards)
+        waitx ##20_000_000/4 'wait ¼ second
+        jmp   #.lp           'loop
+
+It assembles to:
+    00000- FB F7 23 F6 FD FB 23 F6 25 26 80 FF 1F 80 66 FD F0 FF 9F FD
+
+and can be transmitted without a checksum like this:
+    Sender: "> Prop_Hex 0 0 0 0 FB F7 23 F6 FD FB 23 F6 25 26 80 FF 1F 80 66 FD F0 FF 9F FD ~"
+
+In this example, the program image contains 5 longs (in little-endian order), the summation of which is
+    $E6CE9A2C. To generate an embedded checksum long, you would compute:
+    $706F7250 ("Prop" read as a long in little-endian order)
+    - $E6CE9A2C (code summation)
+    ─────────
+    = $89A0D824 (checksum complement)
+
+Those resulting four bytes (the checksum complement) may be appended to the end of the data stream,
+transmitted as follows.
+    Sender: "> Prop_Hex 0 0 0 0 FB F7 23 F6 FD FB 23 F6 25 26 80 FF 1F 80 66 FD F0 FF 9F FD 24 D8 A0 89 ?"
+    Loader: "."
+Note that for verification purposes it doesn't matter where the checksum complement long is placed– only that it
+be long-aligned within your data.
+If transmitting multiple lines (blocks) of code image, it is recommended to start each Base64 data line with a
+greater-than ">" character to keep the baud rate tightly calibrated.
+
+Prop_Txt
+
+The Prop_Txt command is like Prop_Hex, but delivers Base64 data instead of hex bytes. Base64 data is a
+stream of text characters that convey six bits each, and is assembled into bytes as it is received. This format is
+2.25x denser than hex; minimizing transmission size and time.
+
+Base64 Characters and Values
+    Characters:   A–Z, a–z, 0–9, +, /
+    Index Values: $00–$19, $1A–$33, $34–$3D, $3E, $3F
+Whitespaces are ignored among Base64 characters.
+
+Example: Loading a small program:
+
+The program from the Prop_Hex example can be transmitted in Base64 form without a checksum like this:
+    Sender: "> Prop_Txt 0 0 0 0 +/cj9v37I/YlJoD/H4Bm/fD/n/0 ~"
+
+With the checksum complement appended:
+    Sender: "> Prop_Txt 0 0 0 0 +/cj9v37I/YlJoD/H4Bm/fD/n/0k2KCJ ?"
+    Loader: "."
+
+Note that the Base64 stream must be generated using the assembled data's given byte order ($FB, $F7, $23...),
+and from MSB to LSB within each byte (%111110, %111111, %011100, %100011...); however, the checksum is
+calculated on little-endian long values (as with the Prop_Hex command) and must be appended/integrated into
+the assembled data before Base64 conversion.
+
+To keep the baud rate tightly calibrated when transmitting multiple lines (blocks) of code image, start each
+Base64 data line with a greater-than ">" character.

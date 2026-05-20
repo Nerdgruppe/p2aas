@@ -7,22 +7,40 @@ using System.IO.Ports;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 string portName = "/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DUAB9RPU-if00-port0";
+
+const int LoaderBaudRate = 2_000_000;
+const int DefaultUserBaudRate = 115_200;
+const int DefaultUserCodeTimeoutMs = 2_500;
+const int MinUserCodeTimeoutMs = 100;
+const int MaxUserCodeTimeoutMs = 10_000;
+
 const int MaxPayloadSize = 512 * 1024;
 const int SerialChunkSize = 32;
 const string ExpectedDeviceVersion = "Prop_Ver G";
 
+var MaxRequestTime = TimeSpan.FromMilliseconds(10_000);
+
+
 var serialPort = new SerialPort(portName)
 {
-    BaudRate = 115200,
+    BaudRate = LoaderBaudRate,
     DataBits = 8,
+    Parity = Parity.None,
+    StopBits = StopBits.One,
+    Handshake = Handshake.None,
+    DtrEnable = false,
+    RtsEnable = false,
 };
 
 serialPort.Open();
 
+Console.WriteLine("{0}", serialPort.BaudRate);
+
 HttpListener listener = new();
-listener.Prefixes.Add($"http://0.0.0.0:12880/");
+listener.Prefixes.Add("http://*:12880/");
 listener.Start();
 
 Console.WriteLine("Server started. Waiting for connections...");
@@ -38,20 +56,25 @@ while (true)
         continue;
     }
 
-    var cts = new CancellationTokenSource(delay: TimeSpan.FromMilliseconds(10_000));
+    RequestOptions requestOptions;
     try
     {
-        await ProcessWebSocketRequest(context, cts.Token);
+        requestOptions = ParseAndValidateRequestOptions(context.Request);
+    }
+    catch (BadHttpRequestException ex)
+    {
+        await RejectBadRequest(context.Response, ex.Message);
+        continue;
+    }
+
+    var cts = new CancellationTokenSource(delay: MaxRequestTime);
+    try
+    {
+        await ProcessWebSocketRequest(context, requestOptions, cts.Token);
     }
     catch (ProtocolViolationException ex)
     {
-        Console.Error.WriteLine("Protocol violation detected:");
-        Console.Error.WriteLine(ex.ToString());
-    }
-    catch (OperationCanceledException ex)
-    {
-        Console.Error.WriteLine("Connection timed out:");
-        Console.Error.WriteLine(ex.ToString());
+        Console.Error.WriteLine("Protocol violation detected: {0}", ex.Message);
     }
     catch (Exception ex)
     {
@@ -60,50 +83,144 @@ while (true)
     }
 }
 
-
-async Task ProcessWebSocketRequest(HttpListenerContext context, CancellationToken cancellationToken)
+async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions requestOptions, CancellationToken cancellationToken)
 {
     var webSocketContext = await context.AcceptWebSocketAsync(null);
     using var socket = webSocketContext.WebSocket;
-    using var loadTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-    loadTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+    using var userCodeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
+
+    var uploadError = false;
     try
     {
-        var payload = await ReadPayload(socket, loadTimeout.Token);
-        await LoadPayloadToDevice(payload, loadTimeout.Token);
-        await BridgeSocketAndSerial(socket, cancellationToken);
+        var payload = await ReadPayload(socket, cancellationToken);
+
+        uploadError = true;
+        await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, cancellationToken);
+        uploadError = false;
+
+        userCodeTimeout.CancelAfter(requestOptions.UserCodeTimeout);
+        await BridgeSocketAndSerial(socket, userCodeTimeout.Token);
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
     }
     catch (ProtocolViolationException ex)
     {
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.ProtocolError, ex.Message, CancellationToken.None);
-        throw;
+        // Do not rethrow here, this is an expected case.
     }
-    catch (OperationCanceledException) when (loadTimeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+    catch (OperationCanceledException) when (userCodeTimeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
     {
-        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "Timed out while loading payload.", CancellationToken.None);
-        throw;
+        Debug.Assert(!uploadError);
+        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left for user code.", CancellationToken.None);
+        // Do not rethrow here, this is an expected case.
     }
-    catch (Exception ex)
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
-        Console.Error.WriteLine(ex.ToString());
-
+        if (uploadError)
+        {
+            // The upload is under our control, and should not be exposed to the user as a timeout:
+            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", CancellationToken.None);
+            throw;
+        }
+        else
+        {
+            // Do not rethrow here, this is an expected case:
+            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left.", CancellationToken.None);
+        }
+    }
+    catch (Exception)
+    {
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", CancellationToken.None);
         throw;
     }
 
 }
 
-async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, CancellationToken cancellationToken)
+RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
 {
-    var lengthBuffer = await ReadMessage(socket, new byte[sizeof(uint)], cancellationToken);
-    if (lengthBuffer.Length != sizeof(uint))
+    var baudRate = ParsePositiveIntParameter(request, "baudrate", DefaultUserBaudRate);
+    var timeoutMs = ParsePositiveIntParameter(request, "timeout_ms", DefaultUserCodeTimeoutMs);
+
+    if (timeoutMs < MinUserCodeTimeoutMs || timeoutMs > MaxUserCodeTimeoutMs)
     {
-        throw new ProtocolViolationException($"Expected a {sizeof(uint)} byte length prefix, but received {lengthBuffer.Length} bytes.");
+        throw new BadHttpRequestException($"Query parameter 'timeout_ms' must be between {MinUserCodeTimeoutMs} and {MaxUserCodeTimeoutMs} milliseconds.");
     }
 
-    var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(lengthBuffer.Span);
+    EnsureBaudRateIsUsable(baudRate);
+
+    return new RequestOptions(baudRate, TimeSpan.FromMilliseconds(timeoutMs));
+}
+
+int ParsePositiveIntParameter(HttpListenerRequest request, string parameterName, int defaultValue)
+{
+    var rawValue = request.QueryString[parameterName];
+    if (string.IsNullOrWhiteSpace(rawValue))
+    {
+        return defaultValue;
+    }
+
+    if (!int.TryParse(rawValue, out var parsedValue) || parsedValue <= 0)
+    {
+        throw new BadHttpRequestException($"Expected query parameter '{parameterName}' to be a positive integer, but received '{rawValue}'.");
+    }
+
+    return parsedValue;
+}
+
+void EnsureBaudRateIsUsable(int baudRate)
+{
+    var originalBaudRate = serialPort.BaudRate;
+    var originalDtrEnable = serialPort.DtrEnable;
+    var originalRtsEnable = serialPort.RtsEnable;
+
+    try
+    {
+        if (serialPort.IsOpen)
+        {
+            serialPort.Close();
+        }
+
+        serialPort.BaudRate = baudRate;
+        serialPort.Open();
+    }
+    catch (Exception ex) when (ex is ArgumentOutOfRangeException or IOException or UnauthorizedAccessException)
+    {
+        throw new BadHttpRequestException($"Query parameter 'baudrate' is not usable on this serial port: {baudRate}.", ex);
+    }
+    finally
+    {
+        if (serialPort.IsOpen)
+        {
+            serialPort.Close();
+        }
+
+        serialPort.BaudRate = originalBaudRate;
+        serialPort.DtrEnable = originalDtrEnable;
+        serialPort.RtsEnable = originalRtsEnable;
+        serialPort.Open();
+    }
+}
+
+async Task RejectBadRequest(HttpListenerResponse response, string message)
+{
+    response.StatusCode = (int)HttpStatusCode.BadRequest;
+    response.ContentType = "text/plain; charset=utf-8";
+
+    var bytes = Encoding.UTF8.GetBytes(message);
+    response.ContentLength64 = bytes.Length;
+    await response.OutputStream.WriteAsync(bytes);
+    response.Close();
+}
+
+async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, CancellationToken cancellationToken)
+{
+    var initialMessage = await ReadMessage(socket, new byte[MaxPayloadSize + sizeof(uint)], cancellationToken);
+    if (initialMessage.Length < sizeof(uint))
+    {
+        throw new ProtocolViolationException($"Expected at least a {sizeof(uint)} byte length prefix, but received {initialMessage.Length} bytes.");
+    }
+
+    var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(initialMessage.Span[..sizeof(uint)]);
     if (payloadLength == 0)
     {
         throw new ProtocolViolationException("Expected a non-empty payload.");
@@ -114,16 +231,29 @@ async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, CancellationToken
         throw new ProtocolViolationException($"Expected a maximum payload size of {MaxPayloadSize} bytes, but received {payloadLength}.");
     }
 
-    return await ReadMessage(socket, new byte[(int)payloadLength], cancellationToken);
+    if (initialMessage.Length == sizeof(uint))
+    {
+        return await ReadMessage(socket, new byte[(int)payloadLength], cancellationToken);
+    }
+
+    var actualPayloadLength = initialMessage.Length - sizeof(uint);
+    if (actualPayloadLength != payloadLength)
+    {
+        throw new ProtocolViolationException($"Expected {payloadLength} payload bytes, but received {actualPayloadLength} bytes.");
+    }
+
+    return initialMessage[sizeof(uint)..];
 }
 
-async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
+async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, CancellationToken cancellationToken)
 {
     if ((payload.Length % sizeof(uint)) != 0)
     {
         throw new ProtocolViolationException("Payload length must be divisible by 4.");
     }
 
+    serialPort.BaudRate = LoaderBaudRate;
+    await ResetDevice(cancellationToken);
     serialPort.DiscardInBuffer();
     serialPort.DiscardOutBuffer();
 
@@ -159,12 +289,21 @@ async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, CancellationToken c
     switch (response)
     {
         case (byte)'.':
+            serialPort.BaudRate = userBaudRate;
             return;
         case (byte)'!':
             throw new ProtocolViolationException("Device rejected the payload checksum.");
         default:
             throw new ProtocolViolationException($"Unexpected response from Prop_Txt: 0x{response:X2}.");
     }
+}
+
+async Task ResetDevice(CancellationToken cancellationToken)
+{
+    serialPort.DtrEnable = true;
+    await Task.Delay(TimeSpan.FromMilliseconds(5), cancellationToken);
+    serialPort.DtrEnable = false;
+    await Task.Delay(TimeSpan.FromMilliseconds(20), cancellationToken);
 }
 
 byte[] AppendChecksum(ReadOnlySpan<byte> payload)
@@ -284,7 +423,7 @@ async Task<ReadOnlyMemory<byte>> ReadMessage(WebSocket socket, byte[] buffer, Ca
     var endOfMessage = false;
     while (offset < buffer.Length)
     {
-        var result = await socket.ReceiveAsync(buffer[offset..], cancellationToken);
+        var result = await socket.ReceiveAsync(buffer.AsMemory(offset), cancellationToken);
         if (result.MessageType == WebSocketMessageType.Close)
         {
             throw new ProtocolViolationException("Connection closed before the full payload was received.");
@@ -309,4 +448,19 @@ async Task<ReadOnlyMemory<byte>> ReadMessage(WebSocket socket, byte[] buffer, Ca
     }
 
     return buffer[0..offset];
+}
+
+readonly record struct RequestOptions(int UserBaudRate, TimeSpan UserCodeTimeout);
+
+sealed class BadHttpRequestException : Exception
+{
+    public BadHttpRequestException(string message)
+        : base(message)
+    {
+    }
+
+    public BadHttpRequestException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
 }
