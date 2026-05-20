@@ -22,23 +22,12 @@ const int MaxPayloadSize = 512 * 1024;
 const int SerialChunkSize = 256;
 const int ResetAssertTimeMs = 5;
 const int ResetReleaseSettleTimeMs = 15;
+const int PropChkTimeoutMs = 1_000;
 const string ExpectedDeviceVersion = "Prop_Ver G";
 
 var MaxRequestTime = TimeSpan.FromMilliseconds(10_000);
 
-
-using var serialPort = new SerialPort(portName)
-{
-    BaudRate = LoaderBaudRate,
-    DataBits = 8,
-    Parity = Parity.None,
-    StopBits = StopBits.One,
-    Handshake = Handshake.None,
-    DtrEnable = false,
-    RtsEnable = false,
-};
-
-serialPort.Open();
+using var serialPort = await OpenSerialPort(portName);
 
 HttpListener listener = new();
 listener.Prefixes.Add("http://*:12880/");
@@ -148,6 +137,47 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
     }
 }
 
+async Task<SerialPortProxy> OpenSerialPort(string portName)
+{
+    var port = new SerialPortProxy(
+        portName,
+        LoaderBaudRate,
+        TimeSpan.FromMilliseconds(ResetAssertTimeMs),
+        TimeSpan.FromMilliseconds(ResetReleaseSettleTimeMs));
+
+    try
+    {
+        port.Open();
+
+        using var probeTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(PropChkTimeoutMs));
+        try
+        {
+            await port.ResetAsync(probeTimeout.Token);
+
+            await port.WriteAsciiAsync("> ", probeTimeout.Token);
+            await port.WriteAsciiAsync("Prop_Chk 0 0 0 0\r", probeTimeout.Token);
+            _ = await port.ReadLineAsync(probeTimeout.Token);
+
+            var version = (await port.ReadLineAsync(probeTimeout.Token)).Trim(' ', '\r', '\n');
+            if (!string.Equals(version, ExpectedDeviceVersion, StringComparison.Ordinal))
+            {
+                throw new IOException($"Prop_Chk returned '{version}' instead of '{ExpectedDeviceVersion}'.");
+            }
+        }
+        catch (OperationCanceledException ex) when (probeTimeout.IsCancellationRequested)
+        {
+            throw new TimeoutException("Prop_Chk timed out while opening the serial port.", ex);
+        }
+
+        return port;
+    }
+    catch
+    {
+        port.Dispose();
+        throw;
+    }
+}
+
 RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
 {
     var baudRate = ParsePositiveIntParameter(request, "baudrate", DefaultUserBaudRate);
@@ -248,42 +278,28 @@ async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, C
     }
 
     serialPort.BaudRate = LoaderBaudRate;
-    await ResetDevice(cancellationToken);
-    serialPort.DiscardInBuffer();
-    serialPort.DiscardOutBuffer();
+    await serialPort.ResetAsync(cancellationToken);
 
-    await WriteSerialAsciiAsync("> ", cancellationToken);
-
-    await WriteSerialAsciiAsync("Prop_Chk 0 0 0 0\r", cancellationToken);
-
-    // The response begins with CR+LF, so the first ReadSerialLineAsync consumes the empty line
-    // before the "Prop_Ver G" line.
-    _ = await ReadSerialLineAsync(cancellationToken);
-
-    var version = (await ReadSerialLineAsync(cancellationToken)).Trim(' ', '\r', '\n');
-    if (!string.Equals(version, ExpectedDeviceVersion, StringComparison.Ordinal))
-    {
-        Console.Error.WriteLine($"Device identifies as \"{version}\", but expected \"{ExpectedDeviceVersion}\".");
-    }
+    await serialPort.WriteAsciiAsync("> ", cancellationToken);
 
     var checksummedPayload = AppendChecksum(payload.Span);
     var encodedPayload = Convert.ToBase64String(checksummedPayload);
 
-    await WriteSerialAsciiAsync("Prop_Txt 0 0 0 0 ", cancellationToken);
+    await serialPort.WriteAsciiAsync("Prop_Txt 0 0 0 0 ", cancellationToken);
     for (var offset = 0; offset < encodedPayload.Length; offset += SerialChunkSize)
     {
         var chunkLength = Math.Min(SerialChunkSize, encodedPayload.Length - offset);
-        await WriteSerialAsciiAsync(encodedPayload.Substring(offset, chunkLength), cancellationToken);
+        await serialPort.WriteAsciiAsync(encodedPayload.Substring(offset, chunkLength), cancellationToken);
 
         if (offset + chunkLength < encodedPayload.Length)
         {
-            await WriteSerialAsciiAsync("\r> ", cancellationToken);
+            await serialPort.WriteAsciiAsync("\r> ", cancellationToken);
         }
     }
 
-    await WriteSerialAsciiAsync(" ?\r", cancellationToken);
+    await serialPort.WriteAsciiAsync(" ?\r", cancellationToken);
 
-    var response = await ReadSerialByteAsync(cancellationToken);
+    var response = await serialPort.ReadByteAsync(cancellationToken);
     switch (response)
     {
         case (byte)'.':
@@ -296,14 +312,6 @@ async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, C
     }
 }
 
-
-async Task ResetDevice(CancellationToken cancellationToken)
-{
-    serialPort.DtrEnable = true;
-    await Task.Delay(TimeSpan.FromMilliseconds(ResetAssertTimeMs), cancellationToken);
-    serialPort.DtrEnable = false;
-    await Task.Delay(TimeSpan.FromMilliseconds(ResetReleaseSettleTimeMs), cancellationToken);
-}
 
 byte[] AppendChecksum(ReadOnlySpan<byte> payload)
 {
@@ -369,8 +377,7 @@ async Task ForwardSocketToSerial(WebSocket socket, CancellationToken cancellatio
 
         if (result.Count > 0)
         {
-            await serialPort.BaseStream.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken);
-            await serialPort.BaseStream.FlushAsync(cancellationToken);
+            await serialPort.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken);
         }
     }
 }
@@ -380,7 +387,7 @@ async Task ForwardSerialToSocket(WebSocket socket, CancellationToken cancellatio
     var buffer = new byte[4096];
     while (socket.State == WebSocketState.Open)
     {
-        var bytesRead = await serialPort.BaseStream.ReadAsync(buffer, cancellationToken);
+        var bytesRead = await serialPort.ReadAsync(buffer, cancellationToken);
         if (bytesRead == 0)
         {
             return;
@@ -388,39 +395,6 @@ async Task ForwardSerialToSocket(WebSocket socket, CancellationToken cancellatio
 
         await socket.SendAsync(buffer.AsMemory(0, bytesRead), WebSocketMessageType.Binary, true, cancellationToken);
     }
-}
-
-async Task<string> ReadSerialLineAsync(CancellationToken cancellationToken)
-{
-    using var lineBuffer = new MemoryStream();
-    while (true)
-    {
-        var value = await ReadSerialByteAsync(cancellationToken);
-        if (value == (byte)'\n')
-        {
-            return Encoding.ASCII.GetString(lineBuffer.GetBuffer(), 0, (int)lineBuffer.Length);
-        }
-
-        lineBuffer.WriteByte(value);
-    }
-}
-
-async Task<byte> ReadSerialByteAsync(CancellationToken cancellationToken)
-{
-    var buffer = new byte[1];
-    var bytesRead = await serialPort.BaseStream.ReadAsync(buffer, cancellationToken);
-    if (bytesRead == 0)
-    {
-        throw new EndOfStreamException("Serial port closed while waiting for device data.");
-    }
-
-    return buffer[0];
-}
-
-async Task WriteSerialAsciiAsync(string value, CancellationToken cancellationToken)
-{
-    await serialPort.BaseStream.WriteAsync(Encoding.ASCII.GetBytes(value), cancellationToken);
-    await serialPort.BaseStream.FlushAsync(cancellationToken);
 }
 
 async Task CloseSocketIfNeeded(WebSocket socket, WebSocketCloseStatus closeStatus, string statusDescription, CancellationToken cancellationToken)
@@ -462,6 +436,103 @@ async Task<ReadOnlyMemory<byte>> ReadMessage(WebSocket socket, byte[] buffer, Ca
     }
 
     return buffer[0..offset];
+}
+
+sealed class SerialPortProxy : IDisposable
+{
+    private readonly SerialPort port;
+    private readonly TimeSpan resetAssertTime;
+    private readonly TimeSpan resetReleaseSettleTime;
+
+    public SerialPortProxy(string portName, int baudRate, TimeSpan resetAssertTime, TimeSpan resetReleaseSettleTime)
+    {
+        this.resetAssertTime = resetAssertTime;
+        this.resetReleaseSettleTime = resetReleaseSettleTime;
+
+        port = new SerialPort(portName)
+        {
+            BaudRate = baudRate,
+            DataBits = 8,
+            Parity = Parity.None,
+            StopBits = StopBits.One,
+            Handshake = Handshake.None,
+            DtrEnable = false,
+            RtsEnable = false,
+        };
+    }
+
+    public int BaudRate
+    {
+        get => port.BaudRate;
+        set => port.BaudRate = value;
+    }
+
+    public void Open()
+    {
+        port.Open();
+    }
+
+    public async Task ResetAsync(CancellationToken cancellationToken)
+    {
+        port.DtrEnable = true;
+        await Task.Delay(resetAssertTime, cancellationToken);
+
+        // After reset has been held low for a while, clear the buffers
+        // so we get a fresh restart:
+        port.DiscardInBuffer();
+        port.DiscardOutBuffer();
+
+        port.DtrEnable = false;
+        await Task.Delay(resetReleaseSettleTime, cancellationToken);
+    }
+
+    public async Task<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        return await port.BaseStream.ReadAsync(buffer, cancellationToken);
+    }
+
+    public async Task WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+    {
+        await port.BaseStream.WriteAsync(buffer, cancellationToken);
+        await port.BaseStream.FlushAsync(cancellationToken);
+    }
+
+    public async Task<byte> ReadByteAsync(CancellationToken cancellationToken)
+    {
+        var buffer = new byte[1];
+        var bytesRead = await ReadAsync(buffer, cancellationToken);
+        if (bytesRead == 0)
+        {
+            throw new EndOfStreamException("Serial port closed while waiting for device data.");
+        }
+
+        return buffer[0];
+    }
+
+    public async Task<string> ReadLineAsync(CancellationToken cancellationToken)
+    {
+        using var lineBuffer = new MemoryStream();
+        while (true)
+        {
+            var value = await ReadByteAsync(cancellationToken);
+            if (value == (byte)'\n')
+            {
+                return Encoding.ASCII.GetString(lineBuffer.GetBuffer(), 0, (int)lineBuffer.Length);
+            }
+
+            lineBuffer.WriteByte(value);
+        }
+    }
+
+    public Task WriteAsciiAsync(string value, CancellationToken cancellationToken)
+    {
+        return WriteAsync(Encoding.ASCII.GetBytes(value), cancellationToken);
+    }
+
+    public void Dispose()
+    {
+        port.Dispose();
+    }
 }
 
 readonly record struct RequestOptions(int UserBaudRate, TimeSpan UserCodeTimeout);
