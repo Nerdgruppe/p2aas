@@ -18,7 +18,9 @@ const int MinUserCodeTimeoutMs = 100;
 const int MaxUserCodeTimeoutMs = 10_000;
 
 const int MaxPayloadSize = 512 * 1024;
-const int SerialChunkSize = 32;
+const int SerialChunkSize = 256;
+const int ResetAssertTimeMs = 5;
+const int ResetReleaseSettleTimeMs = 15;
 const string ExpectedDeviceVersion = "Prop_Ver G";
 
 var MaxRequestTime = TimeSpan.FromMilliseconds(10_000);
@@ -298,12 +300,13 @@ async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, C
     }
 }
 
+
 async Task ResetDevice(CancellationToken cancellationToken)
 {
     serialPort.DtrEnable = true;
-    await Task.Delay(TimeSpan.FromMilliseconds(5), cancellationToken);
+    await Task.Delay(TimeSpan.FromMilliseconds(ResetAssertTimeMs), cancellationToken);
     serialPort.DtrEnable = false;
-    await Task.Delay(TimeSpan.FromMilliseconds(20), cancellationToken);
+    await Task.Delay(TimeSpan.FromMilliseconds(ResetReleaseSettleTimeMs), cancellationToken);
 }
 
 byte[] AppendChecksum(ReadOnlySpan<byte> payload)
