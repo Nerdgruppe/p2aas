@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
+using System.Buffers;
 
 string portName = "/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DUAB9RPU-if00-port0";
 
@@ -26,7 +27,7 @@ const string ExpectedDeviceVersion = "Prop_Ver G";
 var MaxRequestTime = TimeSpan.FromMilliseconds(10_000);
 
 
-var serialPort = new SerialPort(portName)
+using var serialPort = new SerialPort(portName)
 {
     BaudRate = LoaderBaudRate,
     DataBits = 8,
@@ -39,13 +40,13 @@ var serialPort = new SerialPort(portName)
 
 serialPort.Open();
 
-Console.WriteLine("{0}", serialPort.BaudRate);
-
 HttpListener listener = new();
 listener.Prefixes.Add("http://*:12880/");
 listener.Start();
 
 Console.WriteLine("Server started. Waiting for connections...");
+
+var receiveBuffer = new byte[MaxPayloadSize + sizeof(uint)];
 
 while (true)
 {
@@ -69,10 +70,10 @@ while (true)
         continue;
     }
 
-    var cts = new CancellationTokenSource(delay: MaxRequestTime);
+    using var cts = new CancellationTokenSource(delay: MaxRequestTime);
     try
     {
-        await ProcessWebSocketRequest(context, requestOptions, cts.Token);
+        await ProcessWebSocketRequest(context, requestOptions, receiveBuffer, cts.Token);
     }
     catch (ProtocolViolationException ex)
     {
@@ -89,17 +90,18 @@ while (true)
     }
 }
 
-async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions requestOptions, CancellationToken cancellationToken)
+async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions requestOptions, byte[] receiveBuffer, CancellationToken cancellationToken)
 {
     var webSocketContext = await context.AcceptWebSocketAsync(null);
     using var socket = webSocketContext.WebSocket;
     using var userCodeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
 
+
     var uploadError = false;
     try
     {
-        var payload = await ReadPayload(socket, cancellationToken);
+        var payload = await ReadPayload(socket, receiveBuffer, cancellationToken);
 
         uploadError = true;
         await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, cancellationToken);
@@ -144,7 +146,6 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
         await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", CancellationToken.None);
         throw;
     }
-
 }
 
 RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
@@ -181,18 +182,9 @@ int ParsePositiveIntParameter(HttpListenerRequest request, string parameterName,
 void EnsureBaudRateIsUsable(int baudRate)
 {
     var originalBaudRate = serialPort.BaudRate;
-    var originalDtrEnable = serialPort.DtrEnable;
-    var originalRtsEnable = serialPort.RtsEnable;
-
     try
     {
-        if (serialPort.IsOpen)
-        {
-            serialPort.Close();
-        }
-
         serialPort.BaudRate = baudRate;
-        serialPort.Open();
     }
     catch (Exception ex) when (ex is ArgumentOutOfRangeException or IOException or UnauthorizedAccessException)
     {
@@ -200,15 +192,7 @@ void EnsureBaudRateIsUsable(int baudRate)
     }
     finally
     {
-        if (serialPort.IsOpen)
-        {
-            serialPort.Close();
-        }
-
         serialPort.BaudRate = originalBaudRate;
-        serialPort.DtrEnable = originalDtrEnable;
-        serialPort.RtsEnable = originalRtsEnable;
-        serialPort.Open();
     }
 }
 
@@ -223,9 +207,9 @@ async Task RejectBadRequest(HttpListenerResponse response, string message)
     response.Close();
 }
 
-async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, CancellationToken cancellationToken)
+async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuffer, CancellationToken cancellationToken)
 {
-    var initialMessage = await ReadMessage(socket, new byte[MaxPayloadSize + sizeof(uint)], cancellationToken);
+    var initialMessage = await ReadMessage(socket, receiveBuffer, cancellationToken);
     if (initialMessage.Length < sizeof(uint))
     {
         throw new ProtocolViolationException($"Expected at least a {sizeof(uint)} byte length prefix, but received {initialMessage.Length} bytes.");
@@ -271,6 +255,9 @@ async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, C
     await WriteSerialAsciiAsync("> ", cancellationToken);
 
     await WriteSerialAsciiAsync("Prop_Chk 0 0 0 0\r", cancellationToken);
+
+    // The response begins with CR+LF, so the first ReadSerialLineAsync consumes the empty line
+    // before the "Prop_Ver G" line.
     _ = await ReadSerialLineAsync(cancellationToken);
 
     var version = (await ReadSerialLineAsync(cancellationToken)).Trim(' ', '\r', '\n');
@@ -340,17 +327,32 @@ async Task BridgeSocketAndSerial(WebSocket socket, CancellationToken cancellatio
     var socketToSerial = ForwardSocketToSerial(socket, relayCancellation.Token);
     var serialToSocket = ForwardSerialToSocket(socket, relayCancellation.Token);
 
-    var completedRelay = await Task.WhenAny(socketToSerial, serialToSocket);
-    await completedRelay;
-
-    relayCancellation.Cancel();
+    Exception? relayFailure = null;
 
     try
     {
-        await Task.WhenAll(socketToSerial, serialToSocket);
+        var completedRelay = await Task.WhenAny(socketToSerial, serialToSocket);
+        await completedRelay;
     }
-    catch (OperationCanceledException) when (relayCancellation.IsCancellationRequested)
+    catch (Exception ex)
     {
+        relayFailure = ex;
+        throw;
+    }
+    finally
+    {
+        relayCancellation.Cancel();
+
+        try
+        {
+            await Task.WhenAll(socketToSerial, serialToSocket);
+        }
+        catch (OperationCanceledException) when (relayCancellation.IsCancellationRequested && relayFailure is null)
+        {
+        }
+        catch (Exception) when (relayFailure is not null)
+        {
+        }
     }
 }
 
