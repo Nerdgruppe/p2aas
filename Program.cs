@@ -78,6 +78,10 @@ while (true)
     {
         Console.Error.WriteLine("Protocol violation detected: {0}", ex.Message);
     }
+    catch (WebSocketException ex)
+    {
+        Console.Error.WriteLine("WebSocket closed unexpectedly: {0}", ex.Message);
+    }
     catch (Exception ex)
     {
         Console.Error.WriteLine("Connection failed:");
@@ -129,6 +133,11 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
             // Do not rethrow here, this is an expected case:
             await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left.", CancellationToken.None);
         }
+    }
+    catch (WebSocketException ex)
+    {
+        Console.Error.WriteLine("WebSocket closed unexpectedly: {0}", ex.Message);
+        // Do not rethrow here, this is an expected case.
     }
     catch (Exception)
     {
