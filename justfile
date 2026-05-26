@@ -26,3 +26,13 @@ run: assemble
         -p "{{PORT}}" \
         -t \
         example/payload.bin
+
+publish:
+    @rm -rf bin/Release
+    dotnet publish \
+        --configuration Release \
+        --runtime linux-arm \
+        --self-contained true
+
+deploy: publish
+    file bin/Release/net10.0/linux-arm/publish

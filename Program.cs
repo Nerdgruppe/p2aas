@@ -81,8 +81,8 @@ while (true)
 
 async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions requestOptions, byte[] receiveBuffer, CancellationToken cancellationToken)
 {
-    var webSocketContext = await context.AcceptWebSocketAsync(null);
-    using var socket = webSocketContext.WebSocket;
+    var trace = new ConnectionTrace(context.Request, requestOptions);
+    WebSocket? socket = null;
     using var userCodeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
     var sw = Stopwatch.StartNew();
@@ -92,32 +92,51 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
     var uploadError = false;
     try
     {
-        var payload = await ReadPayload(socket, receiveBuffer, cancellationToken);
+        trace.LogDecision("accepting websocket upgrade");
+        var webSocketContext = await context.AcceptWebSocketAsync(null);
+        socket = webSocketContext.WebSocket;
+        trace.LogDecision($"websocket accepted; state={socket.State}");
+
+        var payload = await ReadPayload(socket, receiveBuffer, trace, cancellationToken);
+        trace.LogDecision($"payload received; bytes={payload.Length}");
 
         Console.Error.WriteLine("Uploading {0} bytes from {1}...", payload.Length, context.Request.RemoteEndPoint);
 
         uploadError = true;
-        await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, cancellationToken);
+        trace.LogDecision($"starting device upload at loader baudrate {LoaderBaudRate}");
+        await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, trace, cancellationToken);
         uploadError = false;
 
         uploadStamp = sw.Elapsed;
+        trace.LogDecision($"upload finished after {uploadStamp.TotalMilliseconds:F3} ms");
 
         userCodeTimeout.CancelAfter(requestOptions.UserCodeTimeout);
-        await BridgeSocketAndSerial(socket, userCodeTimeout.Token);
-        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
+        trace.LogDecision($"starting bidirectional bridge with user timeout {requestOptions.UserCodeTimeout.TotalMilliseconds:F0} ms");
+        await BridgeSocketAndSerial(socket, trace, userCodeTimeout.Token);
+        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.NormalClosure, string.Empty, trace, CancellationToken.None);
 
         exitReason = "completed";
     }
     catch (ProtocolViolationException ex)
     {
-        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.ProtocolError, ex.Message, CancellationToken.None);
+        trace.LogDecision($"protocol violation branch taken: {ex.Message}");
+        if (socket is not null)
+        {
+            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.ProtocolError, ex.Message, trace, CancellationToken.None);
+        }
+
         // Do not rethrow here, this is an expected case.
         exitReason = $"protocol violation: {ex.Message}";
     }
     catch (OperationCanceledException) when (userCodeTimeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
     {
         Debug.Assert(!uploadError);
-        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left for user code.", CancellationToken.None);
+        trace.LogDecision("user timeout branch taken");
+        if (socket is not null)
+        {
+            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left for user code.", trace, CancellationToken.None);
+        }
+
         // Do not rethrow here, this is an expected case.
         exitReason = "user timeout";
     }
@@ -126,37 +145,65 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
         if (uploadError)
         {
             // The upload is under our control, and should not be exposed to the user as a timeout:
-            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", CancellationToken.None);
+            trace.LogDecision("request timeout branch taken during upload");
+            exitReason = "request timeout during upload";
+            if (socket is not null)
+            {
+                await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", trace, CancellationToken.None);
+            }
+
             throw;
         }
         else
         {
             // Do not rethrow here, this is an expected case:
-            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left.", CancellationToken.None);
+            trace.LogDecision("global timeout branch taken after upload");
+            if (socket is not null)
+            {
+                await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left.", trace, CancellationToken.None);
+            }
 
             exitReason = "global timeout";
         }
     }
     catch (WebSocketException ex)
     {
+        trace.LogDecision($"websocket exception branch taken: {ex.Message}");
         Console.Error.WriteLine("WebSocket closed unexpectedly: {0}", ex.Message);
         // Do not rethrow here, this is an expected case.
         exitReason = $"web socket error: {ex.Message}";
     }
-    catch (Exception)
+    catch (Exception ex)
     {
-        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", CancellationToken.None);
+        trace.LogDecision($"unexpected exception branch taken: {ex.GetType().Name}: {ex.Message}");
+        exitReason = $"unexpected exception: {ex.GetType().Name}";
+        if (socket is not null)
+        {
+            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError, "The server experienced an unexpected error.", trace, CancellationToken.None);
+        }
+
         throw;
     }
+    finally
+    {
+        var endTime = sw.Elapsed;
+        trace.LogDecision(
+            $"request finished; uploadMs={uploadStamp.TotalMilliseconds:F3}; executionMs={(endTime - uploadStamp).TotalMilliseconds:F3}; exitReason={exitReason}");
 
-    var endTime = sw.Elapsed;
+        Console.Error.WriteLine(
+            "  {0} ms upload time, {1} ms execution time, {2}",
+            uploadStamp.TotalMilliseconds,
+            (endTime - uploadStamp).TotalMilliseconds,
+            exitReason
+        );
 
-    Console.Error.WriteLine(
-        "  {0} ms upload time, {1} ms execution time, {2}",
-        uploadStamp.TotalMilliseconds,
-        (endTime - uploadStamp).TotalMilliseconds,
-        exitReason
-    );
+        if (!string.Equals(exitReason, "completed", StringComparison.Ordinal))
+        {
+            trace.PrintTo(Console.Error, exitReason);
+        }
+
+        socket?.Dispose();
+    }
 }
 
 async Task<SerialPortProxy> OpenSerialPort(string portName)
@@ -236,7 +283,7 @@ void EnsureBaudRateIsUsable(int baudRate)
     var originalBaudRate = serialPort.BaudRate;
     try
     {
-        serialPort.BaudRate = baudRate;
+        serialPort.SetBaudRate(baudRate);
     }
     catch (Exception ex) when (ex is ArgumentOutOfRangeException or IOException or UnauthorizedAccessException)
     {
@@ -244,7 +291,7 @@ void EnsureBaudRateIsUsable(int baudRate)
     }
     finally
     {
-        serialPort.BaudRate = originalBaudRate;
+        serialPort.SetBaudRate(originalBaudRate);
     }
 }
 
@@ -259,15 +306,13 @@ async Task RejectBadRequest(HttpListenerResponse response, string message)
     response.Close();
 }
 
-async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuffer, CancellationToken cancellationToken)
+async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuffer, ConnectionTrace trace, CancellationToken cancellationToken)
 {
-    var initialMessage = await ReadMessage(socket, receiveBuffer, cancellationToken);
-    if (initialMessage.Length < sizeof(uint))
-    {
-        throw new ProtocolViolationException($"Expected at least a {sizeof(uint)} byte length prefix, but received {initialMessage.Length} bytes.");
-    }
+    trace.LogDecision("reading 4-byte payload length prefix from websocket stream");
+    await ReadExactlyFromWebSocket(socket, receiveBuffer.AsMemory(0, sizeof(uint)), trace, "payload length prefix", cancellationToken);
 
-    var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(initialMessage.Span[..sizeof(uint)]);
+    var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(receiveBuffer.AsSpan(0, sizeof(uint)));
+    trace.LogDecision($"parsed payload length prefix={payloadLength}");
     if (payloadLength == 0)
     {
         throw new ProtocolViolationException("Expected a non-empty payload.");
@@ -278,58 +323,59 @@ async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuf
         throw new ProtocolViolationException($"Expected a maximum payload size of {MaxPayloadSize} bytes, but received {payloadLength}.");
     }
 
-    if (initialMessage.Length == sizeof(uint))
-    {
-        return await ReadMessage(socket, new byte[(int)payloadLength], cancellationToken);
-    }
+    trace.LogDecision($"reading payload body from websocket stream; bytes={payloadLength}");
+    await ReadExactlyFromWebSocket(socket, receiveBuffer.AsMemory(0, (int)payloadLength), trace, "payload body", cancellationToken);
+    trace.LogDecision($"payload body read completed; bytes={payloadLength}");
 
-    var actualPayloadLength = initialMessage.Length - sizeof(uint);
-    if (actualPayloadLength != payloadLength)
-    {
-        throw new ProtocolViolationException($"Expected {payloadLength} payload bytes, but received {actualPayloadLength} bytes.");
-    }
-
-    return initialMessage[sizeof(uint)..];
+    return receiveBuffer.AsMemory(0, (int)payloadLength);
 }
 
-async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, CancellationToken cancellationToken)
+async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, ConnectionTrace trace, CancellationToken cancellationToken)
 {
     if ((payload.Length % sizeof(uint)) != 0)
     {
         throw new ProtocolViolationException("Payload length must be divisible by 4.");
     }
 
-    serialPort.BaudRate = LoaderBaudRate;
-    await serialPort.ResetAsync(cancellationToken);
+    trace.LogDecision($"payload length validated as word-aligned; bytes={payload.Length}");
 
-    await serialPort.WriteAsciiAsync("> ", cancellationToken);
+    serialPort.SetBaudRate(LoaderBaudRate, trace);
+    await serialPort.ResetAsync(cancellationToken, trace);
+
+    await serialPort.WriteAsciiAsync("> ", cancellationToken, trace);
 
     var checksummedPayload = AppendChecksum(payload.Span);
     var encodedPayload = Convert.ToBase64String(checksummedPayload);
+    trace.LogDecision($"payload checksum appended; checksummedBytes={checksummedPayload.Length}; base64Bytes={encodedPayload.Length}");
 
-    await serialPort.WriteAsciiAsync("Prop_Txt 0 0 0 0 ", cancellationToken);
+    await serialPort.WriteAsciiAsync("Prop_Txt 0 0 0 0 ", cancellationToken, trace);
     for (var offset = 0; offset < encodedPayload.Length; offset += SerialChunkSize)
     {
         var chunkLength = Math.Min(SerialChunkSize, encodedPayload.Length - offset);
-        await serialPort.WriteAsciiAsync(encodedPayload.Substring(offset, chunkLength), cancellationToken);
+        trace.LogDecision($"sending Prop_Txt chunk offset={offset} chunkBytes={chunkLength}");
+        await serialPort.WriteAsciiAsync(encodedPayload.Substring(offset, chunkLength), cancellationToken, trace);
 
         if (offset + chunkLength < encodedPayload.Length)
         {
-            await serialPort.WriteAsciiAsync("\r> ", cancellationToken);
+            await serialPort.WriteAsciiAsync("\r> ", cancellationToken, trace);
         }
     }
 
-    await serialPort.WriteAsciiAsync(" ?\r", cancellationToken);
+    await serialPort.WriteAsciiAsync(" ?\r", cancellationToken, trace);
 
-    var response = await serialPort.ReadByteAsync(cancellationToken);
+    trace.LogDecision("waiting for Prop_Txt completion response byte");
+    var response = await serialPort.ReadByteAsync(cancellationToken, trace);
     switch (response)
     {
         case (byte)'.':
-            serialPort.BaudRate = userBaudRate;
+            trace.LogDecision($"device accepted payload; switching to user baudrate {userBaudRate}");
+            serialPort.SetBaudRate(userBaudRate, trace);
             return;
         case (byte)'!':
+            trace.LogDecision("device reported checksum rejection");
             throw new ProtocolViolationException("Device rejected the payload checksum.");
         default:
+            trace.LogDecision($"device returned unexpected Prop_Txt response 0x{response:X2}");
             throw new ProtocolViolationException($"Unexpected response from Prop_Txt: 0x{response:X2}.");
     }
 }
@@ -351,26 +397,32 @@ byte[] AppendChecksum(ReadOnlySpan<byte> payload)
     return checksummedPayload;
 }
 
-async Task BridgeSocketAndSerial(WebSocket socket, CancellationToken cancellationToken)
+async Task BridgeSocketAndSerial(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken)
 {
+    trace.LogDecision("starting socket<->serial relay tasks");
     using var relayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-    var socketToSerial = ForwardSocketToSerial(socket, relayCancellation.Token);
-    var serialToSocket = ForwardSerialToSocket(socket, relayCancellation.Token);
+    var socketToSerial = ForwardSocketToSerial(socket, trace, relayCancellation.Token);
+    var serialToSocket = ForwardSerialToSocket(socket, trace, relayCancellation.Token);
 
     Exception? relayFailure = null;
 
     try
     {
         var completedRelay = await Task.WhenAny(socketToSerial, serialToSocket);
+        trace.LogDecision(completedRelay == socketToSerial
+            ? "socket->serial relay completed first"
+            : "serial->socket relay completed first");
         await completedRelay;
     }
     catch (Exception ex)
     {
         relayFailure = ex;
+        trace.LogDecision($"relay failure observed: {ex.GetType().Name}: {ex.Message}");
         throw;
     }
     finally
     {
+        trace.LogDecision("canceling relay companion task");
         relayCancellation.Cancel();
 
         try
@@ -379,61 +431,77 @@ async Task BridgeSocketAndSerial(WebSocket socket, CancellationToken cancellatio
         }
         catch (OperationCanceledException) when (relayCancellation.IsCancellationRequested && relayFailure is null)
         {
+            trace.LogDecision("relay companion task canceled cleanly");
         }
         catch (Exception) when (relayFailure is not null)
         {
+            trace.LogDecision("relay companion task fault suppressed because another relay already failed");
         }
     }
 }
 
-async Task ForwardSocketToSerial(WebSocket socket, CancellationToken cancellationToken)
+async Task ForwardSocketToSerial(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken)
 {
     var buffer = new byte[4096];
     while (socket.State == WebSocketState.Open)
     {
         var result = await socket.ReceiveAsync(buffer, cancellationToken);
+        trace.LogWebSocketReceive("socket->serial", result, buffer.AsMemory(0, result.Count));
         if (result.MessageType == WebSocketMessageType.Close)
         {
+            trace.LogDecision("socket->serial relay stopped because a close frame was received");
             return;
         }
 
         if (result.Count > 0)
         {
-            await serialPort.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken);
+            await serialPort.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken, trace);
         }
     }
+
+    trace.LogDecision($"socket->serial relay stopped because websocket state became {socket.State}");
 }
 
-async Task ForwardSerialToSocket(WebSocket socket, CancellationToken cancellationToken)
+async Task ForwardSerialToSocket(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken)
 {
     var buffer = new byte[4096];
     while (socket.State == WebSocketState.Open)
     {
-        var bytesRead = await serialPort.ReadAsync(buffer, cancellationToken);
+        var bytesRead = await serialPort.ReadAsync(buffer, cancellationToken, trace);
         if (bytesRead == 0)
         {
+            trace.LogDecision("serial->socket relay stopped because the serial port returned EOF");
             return;
         }
 
+        trace.LogWebSocketSend("serial->socket", WebSocketMessageType.Binary, buffer.AsMemory(0, bytesRead), endOfMessage: true);
         await socket.SendAsync(buffer.AsMemory(0, bytesRead), WebSocketMessageType.Binary, true, cancellationToken);
     }
+
+    trace.LogDecision($"serial->socket relay stopped because websocket state became {socket.State}");
 }
 
-async Task CloseSocketIfNeeded(WebSocket socket, WebSocketCloseStatus closeStatus, string statusDescription, CancellationToken cancellationToken)
+async Task CloseSocketIfNeeded(WebSocket socket, WebSocketCloseStatus closeStatus, string statusDescription, ConnectionTrace trace, CancellationToken cancellationToken)
 {
     if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
     {
+        trace.LogDecision($"sending close frame status={closeStatus} description='{statusDescription}' from state={socket.State}");
         await socket.CloseAsync(closeStatus, statusDescription, cancellationToken);
+        trace.LogDecision($"close frame sent; new websocket state={socket.State}");
+    }
+    else
+    {
+        trace.LogDecision($"close skipped because websocket state was {socket.State}");
     }
 }
 
-async Task<ReadOnlyMemory<byte>> ReadMessage(WebSocket socket, byte[] buffer, CancellationToken cancellationToken)
+async Task ReadExactlyFromWebSocket(WebSocket socket, Memory<byte> buffer, ConnectionTrace trace, string operation, CancellationToken cancellationToken)
 {
     var offset = 0;
-    var endOfMessage = false;
     while (offset < buffer.Length)
     {
-        var result = await socket.ReceiveAsync(buffer.AsMemory(offset), cancellationToken);
+        var result = await socket.ReceiveAsync(buffer[offset..], cancellationToken);
+        trace.LogWebSocketReceive(operation, result, buffer.Slice(offset, result.Count));
         if (result.MessageType == WebSocketMessageType.Close)
         {
             throw new ProtocolViolationException("Connection closed before the full payload was received.");
@@ -445,19 +513,9 @@ async Task<ReadOnlyMemory<byte>> ReadMessage(WebSocket socket, byte[] buffer, Ca
         }
 
         offset += result.Count;
-        if (result.EndOfMessage)
-        {
-            endOfMessage = true;
-            break;
-        }
     }
 
-    if (!endOfMessage)
-    {
-        throw new ProtocolViolationException($"Received a websocket message larger than {buffer.Length} bytes.");
-    }
-
-    return buffer[0..offset];
+    trace.LogDecision($"completed websocket stream read for {operation}; bytes={buffer.Length}");
 }
 
 sealed class SerialPortProxy : IDisposable
@@ -483,19 +541,25 @@ sealed class SerialPortProxy : IDisposable
         };
     }
 
-    public int BaudRate
-    {
-        get => port.BaudRate;
-        set => port.BaudRate = value;
-    }
+    public int BaudRate => port.BaudRate;
 
-    public void Open()
+    public void Open(ConnectionTrace? trace = null)
     {
+        trace?.LogDecision($"opening serial port {port.PortName} at baudrate {port.BaudRate}");
         port.Open();
+        trace?.LogDecision("serial port opened successfully");
     }
 
-    public async Task ResetAsync(CancellationToken cancellationToken)
+    public void SetBaudRate(int baudRate, ConnectionTrace? trace = null)
     {
+        var previousBaudRate = port.BaudRate;
+        port.BaudRate = baudRate;
+        trace?.LogSerialState($"baudrate changed from {previousBaudRate} to {baudRate}");
+    }
+
+    public async Task ResetAsync(CancellationToken cancellationToken, ConnectionTrace? trace = null)
+    {
+        trace?.LogSerialState($"asserting reset via DTR for {resetAssertTime.TotalMilliseconds:F0} ms");
         port.DtrEnable = true;
         await Task.Delay(resetAssertTime, cancellationToken);
 
@@ -503,35 +567,41 @@ sealed class SerialPortProxy : IDisposable
         // so we get a fresh restart:
         port.DiscardInBuffer();
         port.DiscardOutBuffer();
+        trace?.LogSerialState("discarded serial input/output buffers while reset was asserted");
 
         port.DtrEnable = false;
         await Task.Delay(resetReleaseSettleTime, cancellationToken);
+        trace?.LogSerialState($"released reset and waited {resetReleaseSettleTime.TotalMilliseconds:F0} ms for loader readiness");
     }
 
-    public async Task<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+    public async Task<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
-        return await port.BaseStream.ReadAsync(buffer, cancellationToken);
+        var bytesRead = await port.BaseStream.ReadAsync(buffer, cancellationToken);
+        trace?.LogSerialRead("stream read", buffer[..bytesRead].Span);
+        return bytesRead;
     }
 
-    public async Task WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+    public async Task WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
+        trace?.LogSerialWrite("stream write", buffer.Span);
         await port.BaseStream.WriteAsync(buffer, cancellationToken);
         await port.BaseStream.FlushAsync(cancellationToken);
     }
 
-    public async Task<byte> ReadByteAsync(CancellationToken cancellationToken)
+    public async Task<byte> ReadByteAsync(CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
         var buffer = new byte[1];
-        var bytesRead = await ReadAsync(buffer, cancellationToken);
+        var bytesRead = await port.BaseStream.ReadAsync(buffer, cancellationToken);
         if (bytesRead == 0)
         {
             throw new EndOfStreamException("Serial port closed while waiting for device data.");
         }
 
+        trace?.LogSerialRead("byte read", buffer);
         return buffer[0];
     }
 
-    public async Task<string> ReadLineAsync(CancellationToken cancellationToken)
+    public async Task<string> ReadLineAsync(CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
         using var lineBuffer = new MemoryStream();
         while (true)
@@ -539,21 +609,182 @@ sealed class SerialPortProxy : IDisposable
             var value = await ReadByteAsync(cancellationToken);
             if (value == (byte)'\n')
             {
-                return Encoding.ASCII.GetString(lineBuffer.GetBuffer(), 0, (int)lineBuffer.Length);
+                var line = Encoding.ASCII.GetString(lineBuffer.GetBuffer(), 0, (int)lineBuffer.Length);
+                trace?.LogSerialTextRead("line read", line);
+                return line;
             }
 
             lineBuffer.WriteByte(value);
         }
     }
 
-    public Task WriteAsciiAsync(string value, CancellationToken cancellationToken)
+    public async Task WriteAsciiAsync(string value, CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
-        return WriteAsync(Encoding.ASCII.GetBytes(value), cancellationToken);
+        trace?.LogSerialTextWrite("ascii write", value);
+        await port.BaseStream.WriteAsync(Encoding.ASCII.GetBytes(value), cancellationToken);
+        await port.BaseStream.FlushAsync(cancellationToken);
     }
 
     public void Dispose()
     {
         port.Dispose();
+    }
+}
+
+sealed class ConnectionTrace
+{
+    private const int DataPreviewLength = 64;
+
+    private readonly object sync = new();
+    private readonly List<string> entries = [];
+    private readonly Stopwatch stopwatch = Stopwatch.StartNew();
+    private readonly string requestLabel;
+
+    public ConnectionTrace(HttpListenerRequest request, RequestOptions requestOptions)
+    {
+        requestLabel = $"{request.HttpMethod} {request.RawUrl} from {request.RemoteEndPoint}";
+        LogDecision(
+            $"request started; request={requestLabel}; baudrate={requestOptions.UserBaudRate}; timeoutMs={requestOptions.UserCodeTimeout.TotalMilliseconds:F0}");
+    }
+
+    public void LogDecision(string message)
+    {
+        Add("decision", message);
+    }
+
+    public void LogWebSocketReceive(string operation, WebSocketReceiveResult result, ReadOnlyMemory<byte> payload)
+    {
+        LogWebSocketReceiveCore(
+            operation,
+            result.MessageType,
+            result.Count,
+            result.EndOfMessage,
+            result.CloseStatus?.ToString() ?? "-",
+            result.CloseStatusDescription ?? string.Empty,
+            payload);
+    }
+
+    public void LogWebSocketReceive(string operation, ValueWebSocketReceiveResult result, ReadOnlyMemory<byte> payload)
+    {
+        LogWebSocketReceiveCore(
+            operation,
+            result.MessageType,
+            result.Count,
+            result.EndOfMessage,
+            "-",
+            string.Empty,
+            payload);
+    }
+
+    private void LogWebSocketReceiveCore(
+        string operation,
+        WebSocketMessageType messageType,
+        int count,
+        bool endOfMessage,
+        string closeStatus,
+        string closeStatusDescription,
+        ReadOnlyMemory<byte> payload)
+    {
+        Add(
+            "ws recv",
+            $"{operation}; type={messageType}; count={count}; end={endOfMessage}; closeStatus={closeStatus}; closeDescription={FormatText(closeStatusDescription)}; {FormatBytes(payload.Span)}");
+    }
+
+    public void LogWebSocketSend(string operation, WebSocketMessageType messageType, ReadOnlyMemory<byte> payload, bool endOfMessage)
+    {
+        Add(
+            "ws send",
+            $"{operation}; type={messageType}; count={payload.Length}; end={endOfMessage}; {FormatBytes(payload.Span)}");
+    }
+
+    public void LogSerialState(string message)
+    {
+        Add("serial", message);
+    }
+
+    public void LogSerialRead(string operation, ReadOnlySpan<byte> data)
+    {
+        Add("serial rx", $"{operation}; {FormatBytes(data)}");
+    }
+
+    public void LogSerialWrite(string operation, ReadOnlySpan<byte> data)
+    {
+        Add("serial tx", $"{operation}; {FormatBytes(data)}");
+    }
+
+    public void LogSerialTextRead(string operation, string value)
+    {
+        Add("serial rx", $"{operation}; text={FormatText(value)}; bytes={Encoding.ASCII.GetByteCount(value)}");
+    }
+
+    public void LogSerialTextWrite(string operation, string value)
+    {
+        Add("serial tx", $"{operation}; text={FormatText(value)}; bytes={Encoding.ASCII.GetByteCount(value)}");
+    }
+
+    public void PrintTo(TextWriter writer, string exitReason)
+    {
+        string[] snapshot;
+        lock (sync)
+        {
+            snapshot = entries.ToArray();
+        }
+
+        writer.WriteLine($"Connection trace ({exitReason}) for {requestLabel}:");
+        foreach (var entry in snapshot)
+        {
+            writer.WriteLine(entry);
+        }
+    }
+
+    private void Add(string category, string message)
+    {
+        var entry = $"[{stopwatch.Elapsed.TotalMilliseconds,10:F3} ms] {category}: {message}";
+        lock (sync)
+        {
+            entries.Add(entry);
+        }
+    }
+
+    private static string FormatBytes(ReadOnlySpan<byte> data)
+    {
+        if (data.Length == 0)
+        {
+            return "bytes=0";
+        }
+
+        var previewLength = Math.Min(data.Length, DataPreviewLength);
+        var preview = data[..previewLength];
+        var suffix = data.Length > previewLength ? $"...(+{data.Length - previewLength} bytes)" : string.Empty;
+        return $"bytes={data.Length}; hex={Convert.ToHexString(preview)}{suffix}; ascii={FormatAsciiPreview(preview, data.Length > previewLength)}";
+    }
+
+    private static string FormatAsciiPreview(ReadOnlySpan<byte> data, bool truncated)
+    {
+        var chars = new char[data.Length + (truncated ? 3 : 0)];
+        for (var index = 0; index < data.Length; index++)
+        {
+            var value = data[index];
+            chars[index] = value is >= 32 and <= 126 ? (char)value : '.';
+        }
+
+        if (truncated)
+        {
+            chars[^3] = '.';
+            chars[^2] = '.';
+            chars[^1] = '.';
+        }
+
+        return new string(chars);
+    }
+
+    private static string FormatText(string value)
+    {
+        return '"' + value
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal)
+            .Replace("\t", "\\t", StringComparison.Ordinal) + '"';
     }
 }
 
