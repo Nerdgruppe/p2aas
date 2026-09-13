@@ -121,6 +121,18 @@ python example/example.py --code-in-url example/payload.bin
 
 Exit the terminal by sending EOF, typically `Ctrl-D`.
 
+## Example Workflow using `websocat`
+
+It's also possible to use `websocat` to connect to the system. This repository ships as tool to perform urlencode on CLI:
+
+```sh-session
+(.venv) [user@machine p2aas]$ websocat "ws://127.0.0.1:12880/?timeout_ms=10000&code=$(base64 --wrap 0 example/payload.bin | python ./example/urlencode.py)"
+!
+hello, world!
+hello, world!
+(.venv) [user@machine p2aas]$ 
+```
+
 ## Example Payload Workflow
 
 If you have the Propeller toolchain installed, the `justfile` contains a minimal workflow for the sample payload.

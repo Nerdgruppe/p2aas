@@ -378,6 +378,8 @@ async Task RejectBadRequest(HttpListenerResponse response, string message)
     response.StatusCode = (int)HttpStatusCode.BadRequest;
     response.ContentType = "text/plain; charset=utf-8";
 
+    response.AddHeader("X-P2AAS-Error", message);
+
     var bytes = Encoding.UTF8.GetBytes(message);
     response.ContentLength64 = bytes.Length;
     await response.OutputStream.WriteAsync(bytes);
