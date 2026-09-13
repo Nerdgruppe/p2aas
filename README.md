@@ -12,12 +12,12 @@ At a high level, the server:
 2. Validates the board at startup with `Prop_Chk`.
 3. Listens for WebSocket upgrades on `http://*:12880/`.
 4. For each accepted request:
-   - validates query parameters,
-   - reads a length-prefixed binary payload from the WebSocket,
-   - resets the board,
-   - uploads the image through `Prop_Txt`,
-   - switches the serial port to the requested runtime baud rate,
-   - relays bytes in both directions between WebSocket and serial.
+    - validates query parameters,
+    - obtains the payload either from the WebSocket upload stream or from the `code` query parameter,
+    - resets the board,
+    - uploads the image through `Prop_Txt`,
+    - switches the serial port to the requested runtime baud rate,
+    - relays bytes in both directions between WebSocket and serial.
 
 The server currently processes requests sequentially. It is meant to be a small remote loader and terminal endpoint, not a multi-tenant service.
 
@@ -101,6 +101,7 @@ Optional arguments:
 - `--url`: override the websocket URL. Default: `ws://127.0.0.1:12880/`
 - `--baudrate`: runtime serial baud rate after upload
 - `--timeout-ms`: post-upload session timeout in milliseconds
+- `--code-in-url`: send the payload via the URL `code` query parameter instead of via the websocket upload stream
 
 Example:
 
@@ -110,6 +111,12 @@ python example/example.py \
     --baudrate 230400 \
     --timeout-ms 5000 \
     example/payload.bin
+```
+
+To exercise the URL-based upload mode:
+
+```bash
+python example/example.py --code-in-url example/payload.bin
 ```
 
 Exit the terminal by sending EOF, typically `Ctrl-D`.
@@ -160,12 +167,19 @@ Requirements:
 - the request must be a WebSocket upgrade
 - `baudrate`, if present, must be a positive integer usable on the serial port
 - `timeout_ms`, if present, must be a positive integer between `100` and `10000`
+- `code`, if present, must decode as base64 or base64url, must decode to at most `512 * 1024` bytes, and must decode to a byte length divisible by 4
 
 If validation fails, the server returns HTTP `400 Bad Request` with a plain-text message and does not upgrade the connection.
 
 ### State 2: Upload Stream
 
-After the WebSocket is accepted, the client must upload the program image.
+After the WebSocket is accepted, the server chooses the upload source.
+
+If the `code` query parameter is present, that selects URL-upload mode, even when the value is empty. In that mode, the payload comes from the decoded query parameter and the server does not read an upload prelude from the websocket.
+
+If the `code` query parameter is absent, the server uses the websocket upload stream.
+
+#### WebSocket Upload Mode
 
 Semantically, the server reads a byte stream with this shape:
 
@@ -186,7 +200,7 @@ That means all of the following are valid and equivalent from the server's point
 
 In other words, the upload phase is stream-oriented even though WebSocket is frame-based.
 
-Upload invariants enforced by the server:
+Upload invariants enforced in websocket mode:
 
 - the stream must begin with a 4-byte little-endian payload length
 - the payload length must be greater than zero
@@ -194,6 +208,22 @@ Upload invariants enforced by the server:
 - the payload length must be divisible by 4
 - all upload data must arrive as binary WebSocket data
 - if the socket closes before all bytes arrive, the upload fails
+
+#### URL Code Mode
+
+If `code` is present in the URL, the server decodes the payload directly from the query parameter.
+
+Semantics in URL-code mode:
+
+- `code` takes precedence over websocket upload bytes
+- `code=` is valid and selects an empty payload
+- both standard base64 and base64url are accepted
+- URL-upload validation happens before websocket upgrade
+- after the websocket is accepted, the connection proceeds directly toward device upload and then the runtime bridge
+
+Practical note:
+
+- URL length limits depend on the environment in front of the server, so websocket upload remains the safer choice for larger payloads
 
 ### State 3: Loader Translation
 
@@ -279,12 +309,30 @@ Allowed range:
 100..10000
 ```
 
+### `code`
+
+Sets the upload payload directly in the URL as base64-encoded binary.
+
+Semantics:
+
+- if `code` is present, the server does not read the initial upload payload from the websocket
+- `code=` is valid and selects an empty payload
+- both standard base64 and base64url are accepted
+- the decoded payload must be at most `512 * 1024` bytes
+- the decoded payload length must be divisible by 4
+
+Recommendation:
+
+- prefer base64url for generated URLs because it avoids `+` and `/` characters
+- prefer websocket upload for larger payloads because URL length limits vary by client and server environment
+
 Example URLs:
 
 ```text
 ws://127.0.0.1:12880/
 ws://127.0.0.1:12880/?baudrate=230400
 ws://127.0.0.1:12880/?baudrate=230400&timeout_ms=5000
+ws://127.0.0.1:12880/?code=<base64-or-base64url-payload>
 ```
 
 ## Error Behavior
@@ -292,6 +340,7 @@ ws://127.0.0.1:12880/?baudrate=230400&timeout_ms=5000
 Common failure modes:
 
 - invalid query parameters: HTTP `400`
+- invalid `code` query payload: HTTP `400`
 - non-binary upload data: WebSocket protocol error
 - truncated upload stream: WebSocket protocol error
 - oversized or empty payload: WebSocket protocol error
@@ -307,7 +356,8 @@ The server keeps an in-memory per-request trace and prints it when a request doe
 - maximum payload size: `512 KiB`
 - loader baud rate: `2_000_000`
 - runtime default baud rate: `115200`
-- upload framing is stream-oriented across WebSocket messages
+- upload mode is selected by request shape: websocket stream by default, or URL query payload when `code` is present
+- websocket upload framing is stream-oriented across WebSocket messages
 
 ## Limitations
 

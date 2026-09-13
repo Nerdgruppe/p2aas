@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import base64
 import importlib
 import os
 import pathlib
@@ -66,10 +67,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Post-upload user-code timeout in milliseconds passed to the P2AAS server.",
     )
+    parser.add_argument(
+        "--code-in-url",
+        action="store_true",
+        help="Send the payload via the URL `code` query parameter instead of via the websocket upload stream.",
+    )
     return parser.parse_args()
 
 
-def build_url(base_url: str, baudrate: int | None, timeout_ms: int | None) -> str:
+def encode_code_parameter(payload: bytes) -> str:
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def build_url(base_url: str, baudrate: int | None, timeout_ms: int | None, code: str | None) -> str:
     parsed = urllib.parse.urlsplit(base_url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
 
@@ -78,6 +88,9 @@ def build_url(base_url: str, baudrate: int | None, timeout_ms: int | None) -> st
 
     if timeout_ms is not None:
         query.append(("timeout_ms", str(timeout_ms)))
+
+    if code is not None:
+        query.append(("code", code))
 
     return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
 
@@ -164,12 +177,11 @@ async def drain_terminal_output(tracker: OutputTracker) -> None:
         last_activity = tracker.last_activity
 
 
-async def run_terminal(url: str, payload_path: pathlib.Path) -> str:
-    payload = payload_path.read_bytes()
-    upload = struct.pack("<I", len(payload)) + payload
-
+async def run_terminal(url: str, websocket_upload: bytes | None) -> str:
     async with websockets.connect(url, max_size=None) as socket:
-        await socket.send(upload)
+        if websocket_upload is not None:
+            upload = struct.pack("<I", len(websocket_upload)) + websocket_upload
+            await socket.send(upload)
 
         ready_event = asyncio.Event()
         tracker = OutputTracker(ready=ready_event)
@@ -212,11 +224,14 @@ def main() -> None:
     if args.timeout_ms is not None and not (MinUserTimeoutMs <= args.timeout_ms <= MaxUserTimeoutMs):
         raise SystemExit(f"--timeout-ms must be between {MinUserTimeoutMs} and {MaxUserTimeoutMs}")
 
-    url = build_url(args.url, args.baudrate, args.timeout_ms)
+    payload = args.payload.read_bytes()
+    code = encode_code_parameter(payload) if args.code_in_url else None
+    url = build_url(args.url, args.baudrate, args.timeout_ms, code)
+    websocket_upload = None if args.code_in_url else payload
 
     with raw_stdin():
         try:
-            exit_reason = asyncio.run(run_terminal(url, args.payload))
+            exit_reason = asyncio.run(run_terminal(url, websocket_upload))
         except KeyboardInterrupt:
             exit_reason = "KeyboardInterrupt"
 

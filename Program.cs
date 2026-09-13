@@ -97,8 +97,19 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
         socket = webSocketContext.WebSocket;
         trace.LogDecision($"websocket accepted; state={socket.State}");
 
-        var payload = await ReadPayload(socket, receiveBuffer, trace, cancellationToken);
-        trace.LogDecision($"payload received; bytes={payload.Length}");
+        ReadOnlyMemory<byte> payload;
+        if (requestOptions.UploadMode == UploadMode.UrlCode)
+        {
+            Debug.Assert(requestOptions.UrlCodePayload is not null);
+            payload = requestOptions.UrlCodePayload;
+            trace.LogDecision($"using upload payload from URL query parameter 'code'; bytes={payload.Length}");
+        }
+        else
+        {
+            trace.LogDecision("using upload payload from websocket stream");
+            payload = await ReadPayload(socket, receiveBuffer, trace, cancellationToken);
+            trace.LogDecision($"payload received; bytes={payload.Length}");
+        }
 
         Console.Error.WriteLine("Uploading {0} bytes from {1}...", payload.Length, context.Request.RemoteEndPoint);
 
@@ -251,6 +262,7 @@ RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
 {
     var baudRate = ParsePositiveIntParameter(request, "baudrate", DefaultUserBaudRate);
     var timeoutMs = ParsePositiveIntParameter(request, "timeout_ms", DefaultUserCodeTimeoutMs);
+    var urlCodePayload = ParseCodeParameter(request);
 
     if (timeoutMs < MinUserCodeTimeoutMs || timeoutMs > MaxUserCodeTimeoutMs)
     {
@@ -259,7 +271,11 @@ RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
 
     EnsureBaudRateIsUsable(baudRate);
 
-    return new RequestOptions(baudRate, TimeSpan.FromMilliseconds(timeoutMs));
+    return new RequestOptions(
+        urlCodePayload is null ? UploadMode.WebSocket : UploadMode.UrlCode,
+        urlCodePayload,
+        baudRate,
+        TimeSpan.FromMilliseconds(timeoutMs));
 }
 
 int ParsePositiveIntParameter(HttpListenerRequest request, string parameterName, int defaultValue)
@@ -276,6 +292,68 @@ int ParsePositiveIntParameter(HttpListenerRequest request, string parameterName,
     }
 
     return parsedValue;
+}
+
+byte[]? ParseCodeParameter(HttpListenerRequest request)
+{
+    var rawValues = request.QueryString.GetValues("code");
+    if (rawValues is null)
+    {
+        return null;
+    }
+
+    if (rawValues.Length != 1)
+    {
+        throw new BadHttpRequestException("Query parameter 'code' must not appear more than once.");
+    }
+
+    byte[] payload;
+    try
+    {
+        payload = DecodeCodeParameter(rawValues[0] ?? string.Empty);
+    }
+    catch (FormatException ex)
+    {
+        throw new BadHttpRequestException("Query parameter 'code' must be valid base64 or base64url data.", ex);
+    }
+
+    if (payload.Length > MaxPayloadSize)
+    {
+        throw new BadHttpRequestException($"Query parameter 'code' must decode to at most {MaxPayloadSize} bytes, but decoded to {payload.Length} bytes.");
+    }
+
+    if ((payload.Length % sizeof(uint)) != 0)
+    {
+        throw new BadHttpRequestException("Query parameter 'code' must decode to a payload whose length is divisible by 4 bytes.");
+    }
+
+    return payload;
+}
+
+byte[] DecodeCodeParameter(string rawValue)
+{
+    if (rawValue.Length == 0)
+    {
+        return Array.Empty<byte>();
+    }
+
+    var normalized = rawValue
+        .Replace(' ', '+')
+        .Replace('-', '+')
+        .Replace('_', '/');
+
+    return Convert.FromBase64String(PadBase64(normalized));
+}
+
+string PadBase64(string value)
+{
+    return (value.Length % 4) switch
+    {
+        0 => value,
+        2 => value + "==",
+        3 => value + "=",
+        _ => throw new FormatException("Invalid base64 length."),
+    };
 }
 
 void EnsureBaudRateIsUsable(int baudRate)
@@ -644,7 +722,7 @@ sealed class ConnectionTrace
     {
         requestLabel = $"{request.HttpMethod} {request.RawUrl} from {request.RemoteEndPoint}";
         LogDecision(
-            $"request started; request={requestLabel}; baudrate={requestOptions.UserBaudRate}; timeoutMs={requestOptions.UserCodeTimeout.TotalMilliseconds:F0}");
+            $"request started; request={requestLabel}; uploadMode={requestOptions.UploadMode}; baudrate={requestOptions.UserBaudRate}; timeoutMs={requestOptions.UserCodeTimeout.TotalMilliseconds:F0}");
     }
 
     public void LogDecision(string message)
@@ -788,7 +866,13 @@ sealed class ConnectionTrace
     }
 }
 
-readonly record struct RequestOptions(int UserBaudRate, TimeSpan UserCodeTimeout);
+enum UploadMode
+{
+    WebSocket,
+    UrlCode,
+}
+
+readonly record struct RequestOptions(UploadMode UploadMode, byte[]? UrlCodePayload, int UserBaudRate, TimeSpan UserCodeTimeout);
 
 sealed class BadHttpRequestException : Exception
 {
