@@ -370,7 +370,25 @@ Common failure modes:
 - device checksum rejection: upload fails
 - runtime timeout: WebSocket policy violation
 
+Serial transport failures before runtime receive one immediate recovery attempt per request, shared between HTTP baud-rate validation and firmware upload. The server disposes the failed port, opens a fresh instance, and verifies the board with the same `Prop_Chk` probe used at startup. If an upload was interrupted, it resets the board and uploads the complete retained payload again on the same WebSocket. Clients do not need to resend firmware or reconnect; the request may take longer.
+
+Recovery stays within the existing 10-second total request deadline, including hardware validation. The one-second probe timeout is also bounded by that deadline. The requested `timeout_ms` runtime quota starts after the successful upload. There is no backoff or second recovery attempt, and protocol errors, checksum rejection, and cancellation do not trigger recovery.
+
+Failed recovery before the WebSocket upgrade returns HTTP `500` with `The server experienced an unexpected error.` Invalid baud rates still return HTTP `400`. Failed recovery after upgrade closes the WebSocket with `1011` (`InternalServerError`) and the same generic message. Serial failure or EOF during runtime also closes with `1011`; it does not restart the program. The next request can recover the failed port using its own allowance. Startup still fails if the initial open or probe fails.
+
 The server keeps an in-memory per-request trace and prints it when a request does not end as `completed`. That trace includes websocket activity, serial activity, timestamps, and major branch decisions, which makes it the primary debugging aid for failed sessions.
+
+## Recovery Checks
+
+Run the hardware-free recovery checks with .NET 10 and Python's `websockets` package:
+
+```bash
+.venv/bin/python p2aas/test_recovery.py
+```
+
+Stop any server listening on port `12880` first. The harness compiles the actual server source against a fake serial adapter, exercises validation and upload recovery, checks failure close handshakes and runtime cleanup, and runs the existing timeout check. It verifies payload retransmission in WebSocket and URL upload modes and that pending runtime input survives an upload retry. The test project has no package dependencies.
+
+For physical verification, run against the configured Propeller 2 adapter and interrupt its connection during a sufficiently large upload, restoring it before the immediate reopen attempt. Confirm that the request completes on the same WebSocket and logs a successful recovery. Disconnect during runtime and confirm close code `1011`, then restore the adapter and submit another request. The new request should reopen and probe it. Timing and native driver behavior require this hardware check in addition to the simulated faults.
 
 ## Implementation Notes
 

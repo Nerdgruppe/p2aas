@@ -61,9 +61,37 @@ while (true)
     }
 
     using var cts = new CancellationTokenSource(delay: MaxRequestTime);
+    var recovery = new SerialRecoveryState();
+    var trace = new ConnectionTrace(context.Request, requestOptions);
     try
     {
-        await ProcessWebSocketRequest(context, requestOptions, receiveBuffer, cts.Token);
+        await EnsureBaudRateIsUsable(requestOptions.UserBaudRate, recovery, trace, cts.Token);
+    }
+    catch (BadHttpRequestException ex)
+    {
+        await RejectBadRequest(context.Response, ex.Message);
+        continue;
+    }
+    catch (Exception ex)
+    {
+        trace.LogDecision($"serial validation failed: {ex}");
+        trace.PrintTo(Console.Error, "serial validation failed");
+        context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+        var error = Encoding.UTF8.GetBytes("The server experienced an unexpected error.");
+        context.Response.ContentType = "text/plain; charset=utf-8";
+        context.Response.ContentLength64 = error.Length;
+        try { await context.Response.OutputStream.WriteAsync(error); }
+        catch (Exception responseError) when (responseError is IOException or HttpListenerException)
+        {
+            Console.Error.WriteLine($"Failed to send HTTP error response: {responseError.Message}");
+        }
+        finally { context.Response.Close(); }
+        continue;
+    }
+
+    try
+    {
+        await ProcessWebSocketRequest(context, requestOptions, receiveBuffer, recovery, trace, cts.Token);
     }
     catch (ProtocolViolationException ex)
     {
@@ -80,9 +108,8 @@ while (true)
     }
 }
 
-async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions requestOptions, byte[] receiveBuffer, CancellationToken cancellationToken)
+async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions requestOptions, byte[] receiveBuffer, SerialRecoveryState recovery, ConnectionTrace trace, CancellationToken cancellationToken)
 {
-    var trace = new ConnectionTrace(context.Request, requestOptions);
     WebSocket? socket = null;
     using var userCodeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
@@ -143,7 +170,23 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
 
         uploadError = true;
         trace.LogDecision($"starting device upload at loader baudrate {LoaderBaudRate}");
-        await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, trace, cancellationToken);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                await LoadPayloadToDevice(payload, requestOptions.UserBaudRate, trace, cancellationToken);
+                break;
+            }
+            catch (Exception ex) when (IsSerialFailure(ex))
+            {
+                trace.LogDecision($"device upload failed: {ex.GetType().Name}: {ex.Message}");
+                serialPort.MarkUnusable();
+                if (recovery.Attempted) throw;
+                await RecoverSerialPort(recovery, trace, cancellationToken);
+                trace.LogDecision("restarting complete device upload with retained payload");
+            }
+        }
         uploadError = false;
 
         uploadStamp = sw.Elapsed;
@@ -238,36 +281,12 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
 
 async Task<SerialPortProxy> OpenSerialPort(string portName)
 {
-    var port = new SerialPortProxy(
-        portName,
-        LoaderBaudRate,
-        TimeSpan.FromMilliseconds(ResetAssertTimeMs),
-        TimeSpan.FromMilliseconds(ResetReleaseSettleTimeMs));
-
+    var port = new SerialPortProxy(portName, LoaderBaudRate,
+        TimeSpan.FromMilliseconds(ResetAssertTimeMs), TimeSpan.FromMilliseconds(ResetReleaseSettleTimeMs));
     try
     {
         port.Open();
-
-        using var probeTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(PropChkTimeoutMs));
-        try
-        {
-            await port.ResetAsync(probeTimeout.Token);
-
-            await port.WriteAsciiAsync("> ", probeTimeout.Token);
-            await port.WriteAsciiAsync("Prop_Chk 0 0 0 0\r", probeTimeout.Token);
-            _ = await port.ReadLineAsync(probeTimeout.Token);
-
-            var version = (await port.ReadLineAsync(probeTimeout.Token)).Trim(' ', '\r', '\n');
-            if (!string.Equals(version, ExpectedDeviceVersion, StringComparison.Ordinal))
-            {
-                throw new IOException($"Prop_Chk returned '{version}' instead of '{ExpectedDeviceVersion}'.");
-            }
-        }
-        catch (OperationCanceledException ex) when (probeTimeout.IsCancellationRequested)
-        {
-            throw new TimeoutException("Prop_Chk timed out while opening the serial port.", ex);
-        }
-
+        await ProbeSerialPort(port, CancellationToken.None);
         return port;
     }
     catch
@@ -276,6 +295,54 @@ async Task<SerialPortProxy> OpenSerialPort(string portName)
         throw;
     }
 }
+
+async Task ProbeSerialPort(SerialPortProxy port, CancellationToken cancellationToken, ConnectionTrace? trace = null)
+{
+    using var probeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+    probeTimeout.CancelAfter(TimeSpan.FromMilliseconds(PropChkTimeoutMs));
+    try
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        port.SetBaudRate(LoaderBaudRate, trace);
+        await port.ResetAsync(probeTimeout.Token, trace);
+        await port.WriteAsciiAsync("> ", probeTimeout.Token, trace);
+        await port.WriteAsciiAsync("Prop_Chk 0 0 0 0\r", probeTimeout.Token, trace);
+        _ = await port.ReadLineAsync(probeTimeout.Token, trace);
+        var version = (await port.ReadLineAsync(probeTimeout.Token, trace)).Trim(' ', '\r', '\n');
+        if (!string.Equals(version, ExpectedDeviceVersion, StringComparison.Ordinal))
+            throw new IOException($"Prop_Chk returned '{version}' instead of '{ExpectedDeviceVersion}'.");
+        trace?.LogDecision("serial port probe succeeded");
+    }
+    catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested && probeTimeout.IsCancellationRequested)
+    {
+        throw new TimeoutException("Prop_Chk timed out while opening the serial port.", ex);
+    }
+}
+
+async Task RecoverSerialPort(SerialRecoveryState recovery, ConnectionTrace trace, CancellationToken cancellationToken)
+{
+    serialPort.MarkUnusable();
+    cancellationToken.ThrowIfCancellationRequested();
+    if (recovery.Attempted)
+        throw new IOException("Serial port recovery allowance exhausted.");
+    recovery.Attempted = true;
+    trace.LogDecision("attempting the request's single serial port reopen");
+    try
+    {
+        serialPort.Reopen(LoaderBaudRate, trace);
+        await ProbeSerialPort(serialPort, cancellationToken, trace);
+        trace.LogDecision("serial port recovery succeeded");
+    }
+    catch
+    {
+        serialPort.MarkUnusable();
+        throw;
+    }
+}
+
+bool IsSerialFailure(Exception ex) =>
+    ex is IOException or UnauthorizedAccessException ||
+    (ex is ObjectDisposedException or InvalidOperationException) && !serialPort.IsUsable;
 
 RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
 {
@@ -287,8 +354,6 @@ RequestOptions ParseAndValidateRequestOptions(HttpListenerRequest request)
     {
         throw new BadHttpRequestException($"Query parameter 'timeout_ms' must be between {MinUserCodeTimeoutMs} and {MaxUserCodeTimeoutMs} milliseconds.");
     }
-
-    EnsureBaudRateIsUsable(baudRate);
 
     return new RequestOptions(
         urlCodePayload is null ? UploadMode.WebSocket : UploadMode.UrlCode,
@@ -379,20 +444,46 @@ string PadBase64(string value)
     };
 }
 
-void EnsureBaudRateIsUsable(int baudRate)
+async Task EnsureBaudRateIsUsable(int baudRate, SerialRecoveryState recovery, ConnectionTrace trace, CancellationToken cancellationToken)
 {
-    var originalBaudRate = serialPort.BaudRate;
-    try
+    while (true)
     {
-        serialPort.SetBaudRate(baudRate);
-    }
-    catch (Exception ex) when (ex is ArgumentOutOfRangeException or IOException or UnauthorizedAccessException)
-    {
-        throw new BadHttpRequestException($"Query parameter 'baudrate' is not usable on this serial port: {baudRate}.", ex);
-    }
-    finally
-    {
-        serialPort.SetBaudRate(originalBaudRate);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!serialPort.IsUsable)
+            await RecoverSerialPort(recovery, trace, cancellationToken);
+
+        var originalBaudRate = serialPort.BaudRate;
+        Exception? failure = null;
+        try { serialPort.SetBaudRate(baudRate, trace); }
+        catch (Exception ex) when (ex is ArgumentOutOfRangeException || IsSerialFailure(ex)) { failure = ex; }
+        var baudRateRejected = failure is not null;
+        try { serialPort.SetBaudRate(originalBaudRate, trace); }
+        catch (Exception ex) when (IsSerialFailure(ex))
+        {
+            if (failure is ArgumentOutOfRangeException) serialPort.MarkUnusable();
+            trace.LogDecision($"restoring baudrate failed: {ex.GetType().Name}: {ex.Message}");
+            failure ??= ex; // Preserve the original failure when restoration also fails.
+        }
+
+        if (failure is null) return;
+        if (failure is ArgumentOutOfRangeException)
+            throw new BadHttpRequestException($"Query parameter 'baudrate' is not usable on this serial port: {baudRate}.", failure);
+
+        // A healthy connection distinguishes an unsupported baud rate from a lost device.
+        try
+        {
+            await ProbeSerialPort(serialPort, cancellationToken, trace);
+        }
+        catch (Exception ex) when (IsSerialFailure(ex) || ex is TimeoutException)
+        {
+            trace.LogDecision($"baudrate validation lost the device: {failure}; probe failed: {ex.Message}");
+            serialPort.MarkUnusable();
+            if (recovery.Attempted) ExceptionDispatchInfo.Capture(failure).Throw();
+            await RecoverSerialPort(recovery, trace, cancellationToken);
+            continue;
+        }
+        if (!baudRateRejected) return; // A failed restoration must not turn a valid baud rate into HTTP 400.
+        throw new BadHttpRequestException($"Query parameter 'baudrate' is not usable on this serial port: {baudRate}.", failure);
     }
 }
 
@@ -522,6 +613,7 @@ async Task BridgeSocketAndSerial(WebSocket socket, ConnectionTrace trace, Cancel
     catch (Exception ex)
     {
         relayFailure = ex;
+        if (IsSerialFailure(ex)) serialPort.MarkUnusable();
         trace.LogDecision($"relay failure observed: {ex.GetType().Name}: {ex.Message}");
     }
 
@@ -541,6 +633,7 @@ async Task BridgeSocketAndSerial(WebSocket socket, ConnectionTrace trace, Cancel
             socketCancellation.Cancel();
             socket.Abort();
         }
+        if (IsSerialFailure(ex)) serialPort.MarkUnusable();
         relayFailure ??= ex;
     }
 
@@ -568,6 +661,7 @@ async Task BridgeSocketAndSerial(WebSocket socket, ConnectionTrace trace, Cancel
     catch (Exception ex)
     {
         trace.LogDecision($"relay cleanup failed: {ex.GetType().Name}: {ex.Message}");
+        if (IsSerialFailure(ex)) serialPort.MarkUnusable();
         relayFailure ??= ex;
     }
 
@@ -604,12 +698,6 @@ async Task ForwardSerialToSocket(WebSocket socket, ConnectionTrace trace, Cancel
     {
         var bytesRead = await serialPort.ReadAsync(buffer, cancellationToken, trace);
         cancellationToken.ThrowIfCancellationRequested();
-        if (bytesRead == 0)
-        {
-            trace.LogDecision("serial->socket relay stopped because the serial port returned EOF");
-            return;
-        }
-
         trace.LogWebSocketSend("serial->socket", WebSocketMessageType.Binary, buffer.AsMemory(0, bytesRead), endOfMessage: true);
         await socket.SendAsync(buffer.AsMemory(0, bytesRead), WebSocketMessageType.Binary, true, socketCancellationToken);
     }
@@ -667,7 +755,8 @@ async Task ReadExactlyFromWebSocket(WebSocket socket, Memory<byte> buffer, Conne
 
 sealed class SerialPortProxy : IDisposable
 {
-    private readonly SerialPort port;
+    private SerialPort port;
+    private bool unusable;
     private readonly TimeSpan resetAssertTime;
     private readonly TimeSpan resetReleaseSettleTime;
 
@@ -676,24 +765,41 @@ sealed class SerialPortProxy : IDisposable
         this.resetAssertTime = resetAssertTime;
         this.resetReleaseSettleTime = resetReleaseSettleTime;
 
-        port = new SerialPort(portName)
-        {
-            BaudRate = baudRate,
-            DataBits = 8,
-            Parity = Parity.None,
-            StopBits = StopBits.One,
-            Handshake = Handshake.None,
-            DtrEnable = false,
-            RtsEnable = false,
-        };
+        port = CreatePort(portName, baudRate);
     }
 
+    private static SerialPort CreatePort(string portName, int baudRate) => new(portName)
+    {
+        BaudRate = baudRate,
+        DataBits = 8,
+        Parity = Parity.None,
+        StopBits = StopBits.One,
+        Handshake = Handshake.None,
+        DtrEnable = false,
+        RtsEnable = false,
+    };
+
     public int BaudRate => port.BaudRate;
+    public bool IsUsable => !unusable && port.IsOpen;
+    public void MarkUnusable() => unusable = true;
+
+    public void Reopen(int baudRate, ConnectionTrace trace)
+    {
+        var portName = port.PortName;
+        try { port.Dispose(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            trace.LogDecision($"disposing failed serial port: {ex.Message}");
+        }
+        port = CreatePort(portName, baudRate);
+        Open(trace);
+    }
 
     public void Open(ConnectionTrace? trace = null)
     {
         trace?.LogDecision($"opening serial port {port.PortName} at baudrate {port.BaudRate}");
         port.Open();
+        unusable = false;
         trace?.LogDecision("serial port opened successfully");
     }
 
@@ -724,6 +830,9 @@ sealed class SerialPortProxy : IDisposable
     public async Task<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
         var bytesRead = await port.BaseStream.ReadAsync(buffer, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (bytesRead == 0)
+            throw new EndOfStreamException("Serial port closed while waiting for device data.");
         trace?.LogSerialRead("stream read", buffer[..bytesRead].Span);
         return bytesRead;
     }
@@ -738,13 +847,7 @@ sealed class SerialPortProxy : IDisposable
     public async Task<byte> ReadByteAsync(CancellationToken cancellationToken, ConnectionTrace? trace = null)
     {
         var buffer = new byte[1];
-        var bytesRead = await port.BaseStream.ReadAsync(buffer, cancellationToken);
-        if (bytesRead == 0)
-        {
-            throw new EndOfStreamException("Serial port closed while waiting for device data.");
-        }
-
-        trace?.LogSerialRead("byte read", buffer);
+        await ReadAsync(buffer, cancellationToken, trace);
         return buffer[0];
     }
 
@@ -753,7 +856,7 @@ sealed class SerialPortProxy : IDisposable
         using var lineBuffer = new MemoryStream();
         while (true)
         {
-            var value = await ReadByteAsync(cancellationToken);
+            var value = await ReadByteAsync(cancellationToken, trace);
             if (value == (byte)'\n')
             {
                 var line = Encoding.ASCII.GetString(lineBuffer.GetBuffer(), 0, (int)lineBuffer.Length);
@@ -954,4 +1057,9 @@ sealed class BadHttpRequestException : Exception
         : base(message, innerException)
     {
     }
+}
+
+sealed class SerialRecoveryState
+{
+    public bool Attempted { get; set; }
 }
