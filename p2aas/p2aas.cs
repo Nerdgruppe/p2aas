@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Buffers;
+using System.Runtime.ExceptionServices;
 
 string portName = "/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DUAB9RPU-if00-port0";
 
@@ -107,7 +108,34 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
         else
         {
             trace.LogDecision("using upload payload from websocket stream");
-            payload = await ReadPayload(socket, receiveBuffer, trace, cancellationToken);
+            uploadError = true;
+            using var uploadCancellation = new CancellationTokenSource();
+            var payloadTask = ReadPayload(socket, receiveBuffer, trace, uploadCancellation.Token);
+            try
+            {
+                payload = await payloadTask.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try
+                {
+                    await CloseSocketIfNeeded(socket, WebSocketCloseStatus.InternalServerError,
+                        "The server experienced an unexpected error.", trace, closeTimeout.Token);
+                }
+                catch (Exception ex)
+                {
+                    trace.LogDecision($"upload timeout close handshake failed: {ex.GetType().Name}: {ex.Message}");
+                    uploadCancellation.Cancel();
+                    socket.Abort();
+                }
+                try { await payloadTask; }
+                catch (Exception ex)
+                {
+                    trace.LogDecision($"upload reader stopped after timeout: {ex.GetType().Name}: {ex.Message}");
+                }
+                throw;
+            }
             trace.LogDecision($"payload received; bytes={payload.Length}");
         }
 
@@ -123,8 +151,7 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
 
         userCodeTimeout.CancelAfter(requestOptions.UserCodeTimeout);
         trace.LogDecision($"starting bidirectional bridge with user timeout {requestOptions.UserCodeTimeout.TotalMilliseconds:F0} ms");
-        await BridgeSocketAndSerial(socket, trace, userCodeTimeout.Token);
-        await CloseSocketIfNeeded(socket, WebSocketCloseStatus.NormalClosure, string.Empty, trace, CancellationToken.None);
+        await BridgeSocketAndSerial(socket, trace, userCodeTimeout.Token, cancellationToken);
 
         exitReason = "completed";
     }
@@ -143,10 +170,6 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
     {
         Debug.Assert(!uploadError);
         trace.LogDecision("user timeout branch taken");
-        if (socket is not null)
-        {
-            await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left for user code.", trace, CancellationToken.None);
-        }
 
         // Do not rethrow here, this is an expected case.
         exitReason = "user timeout";
@@ -169,10 +192,6 @@ async Task ProcessWebSocketRequest(HttpListenerContext context, RequestOptions r
         {
             // Do not rethrow here, this is an expected case:
             trace.LogDecision("global timeout branch taken after upload");
-            if (socket is not null)
-            {
-                await CloseSocketIfNeeded(socket, WebSocketCloseStatus.PolicyViolation, "No time quota left.", trace, CancellationToken.None);
-            }
 
             exitReason = "global timeout";
         }
@@ -332,10 +351,14 @@ byte[]? ParseCodeParameter(HttpListenerRequest request)
 
 byte[] DecodeCodeParameter(string rawValue)
 {
+    rawValue = rawValue.Replace(" ", "").Replace("\r\n", "").Replace("\n", "");
+
     if (rawValue.Length == 0)
     {
         return Array.Empty<byte>();
     }
+
+
 
     var normalized = rawValue
         .Replace(' ', '+')
@@ -380,16 +403,18 @@ async Task RejectBadRequest(HttpListenerResponse response, string message)
 
     response.AddHeader("X-P2AAS-Error", message);
 
+    Console.Error.WriteLine($"Bad request: {message}");
+
     var bytes = Encoding.UTF8.GetBytes(message);
     response.ContentLength64 = bytes.Length;
     await response.OutputStream.WriteAsync(bytes);
     response.Close();
 }
 
-async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuffer, ConnectionTrace trace, CancellationToken cancellationToken)
+async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuffer, ConnectionTrace trace, CancellationToken socketCancellationToken)
 {
     trace.LogDecision("reading 4-byte payload length prefix from websocket stream");
-    await ReadExactlyFromWebSocket(socket, receiveBuffer.AsMemory(0, sizeof(uint)), trace, "payload length prefix", cancellationToken);
+    await ReadExactlyFromWebSocket(socket, receiveBuffer.AsMemory(0, sizeof(uint)), trace, "payload length prefix", socketCancellationToken);
 
     var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(receiveBuffer.AsSpan(0, sizeof(uint)));
     trace.LogDecision($"parsed payload length prefix={payloadLength}");
@@ -404,7 +429,7 @@ async Task<ReadOnlyMemory<byte>> ReadPayload(WebSocket socket, byte[] receiveBuf
     }
 
     trace.LogDecision($"reading payload body from websocket stream; bytes={payloadLength}");
-    await ReadExactlyFromWebSocket(socket, receiveBuffer.AsMemory(0, (int)payloadLength), trace, "payload body", cancellationToken);
+    await ReadExactlyFromWebSocket(socket, receiveBuffer.AsMemory(0, (int)payloadLength), trace, "payload body", socketCancellationToken);
     trace.LogDecision($"payload body read completed; bytes={payloadLength}");
 
     return receiveBuffer.AsMemory(0, (int)payloadLength);
@@ -477,55 +502,85 @@ byte[] AppendChecksum(ReadOnlySpan<byte> payload)
     return checksummedPayload;
 }
 
-async Task BridgeSocketAndSerial(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken)
+async Task BridgeSocketAndSerial(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken, CancellationToken requestCancellationToken)
 {
     trace.LogDecision("starting socket<->serial relay tasks");
     using var relayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-    var socketToSerial = ForwardSocketToSerial(socket, trace, relayCancellation.Token);
-    var serialToSocket = ForwardSerialToSocket(socket, trace, relayCancellation.Token);
+    using var socketCancellation = new CancellationTokenSource();
+    var socketToSerial = ForwardSocketToSerial(socket, trace, relayCancellation.Token, socketCancellation.Token);
+    var serialToSocket = ForwardSerialToSocket(socket, trace, relayCancellation.Token, socketCancellation.Token);
 
     Exception? relayFailure = null;
-
+    var completedRelay = await Task.WhenAny(socketToSerial, serialToSocket);
+    trace.LogDecision(completedRelay == socketToSerial
+        ? "socket->serial relay completed first"
+        : "serial->socket relay completed first");
     try
     {
-        var completedRelay = await Task.WhenAny(socketToSerial, serialToSocket);
-        trace.LogDecision(completedRelay == socketToSerial
-            ? "socket->serial relay completed first"
-            : "serial->socket relay completed first");
         await completedRelay;
     }
     catch (Exception ex)
     {
         relayFailure = ex;
         trace.LogDecision($"relay failure observed: {ex.GetType().Name}: {ex.Message}");
-        throw;
     }
-    finally
-    {
-        trace.LogDecision("canceling relay companion task");
-        relayCancellation.Cancel();
 
-        try
-        {
-            await Task.WhenAll(socketToSerial, serialToSocket);
-        }
-        catch (OperationCanceledException) when (relayCancellation.IsCancellationRequested && relayFailure is null)
-        {
-            trace.LogDecision("relay companion task canceled cleanly");
-        }
-        catch (Exception) when (relayFailure is not null)
-        {
-            trace.LogDecision("relay companion task fault suppressed because another relay already failed");
-        }
+    trace.LogDecision("canceling serial relay companion task");
+    relayCancellation.Cancel();
+    using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+    try
+    {
+        await serialToSocket.WaitAsync(closeTimeout.Token); // No send may overlap the close frame.
     }
+    catch (OperationCanceledException) when (serialToSocket.IsCanceled && relayCancellation.IsCancellationRequested) { }
+    catch (Exception ex)
+    {
+        trace.LogDecision($"serial relay companion failed: {ex.GetType().Name}: {ex.Message}");
+        if (!serialToSocket.IsCompleted)
+        {
+            socketCancellation.Cancel();
+            socket.Abort();
+        }
+        relayFailure ??= ex;
+    }
+
+    var timedOut = cancellationToken.IsCancellationRequested && relayFailure is OperationCanceledException;
+    var closeStatus = relayFailure is null ? WebSocketCloseStatus.NormalClosure
+        : timedOut ? WebSocketCloseStatus.PolicyViolation : WebSocketCloseStatus.InternalServerError;
+    var closeReason = timedOut
+        ? requestCancellationToken.IsCancellationRequested ? "No time quota left." : "No time quota left for user code."
+        : relayFailure is null ? string.Empty : "The server experienced an unexpected error.";
+
+    try
+    {
+        await CloseSocketIfNeeded(socket, closeStatus, closeReason, trace, closeTimeout.Token);
+    }
+    catch (Exception ex)
+    {
+        trace.LogDecision($"close handshake failed: {ex.GetType().Name}: {ex.Message}");
+        socketCancellation.Cancel();
+        socket.Abort();
+        relayFailure ??= ex;
+    }
+
+    try { await Task.WhenAll(socketToSerial, serialToSocket); }
+    catch (OperationCanceledException) when (relayCancellation.IsCancellationRequested) { }
+    catch (Exception ex)
+    {
+        trace.LogDecision($"relay cleanup failed: {ex.GetType().Name}: {ex.Message}");
+        relayFailure ??= ex;
+    }
+
+    if (relayFailure is not null) ExceptionDispatchInfo.Capture(relayFailure).Throw();
 }
 
-async Task ForwardSocketToSerial(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken)
+async Task ForwardSocketToSerial(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken, CancellationToken socketCancellationToken)
 {
     var buffer = new byte[4096];
     while (socket.State == WebSocketState.Open)
     {
-        var result = await socket.ReceiveAsync(buffer, cancellationToken);
+        // The serial timeout must leave this receive alive to consume the close reply.
+        var result = await socket.ReceiveAsync(buffer, socketCancellationToken);
         trace.LogWebSocketReceive("socket->serial", result, buffer.AsMemory(0, result.Count));
         if (result.MessageType == WebSocketMessageType.Close)
         {
@@ -533,7 +588,7 @@ async Task ForwardSocketToSerial(WebSocket socket, ConnectionTrace trace, Cancel
             return;
         }
 
-        if (result.Count > 0)
+        if (result.Count > 0 && !cancellationToken.IsCancellationRequested)
         {
             await serialPort.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken, trace);
         }
@@ -542,12 +597,13 @@ async Task ForwardSocketToSerial(WebSocket socket, ConnectionTrace trace, Cancel
     trace.LogDecision($"socket->serial relay stopped because websocket state became {socket.State}");
 }
 
-async Task ForwardSerialToSocket(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken)
+async Task ForwardSerialToSocket(WebSocket socket, ConnectionTrace trace, CancellationToken cancellationToken, CancellationToken socketCancellationToken)
 {
     var buffer = new byte[4096];
     while (socket.State == WebSocketState.Open)
     {
         var bytesRead = await serialPort.ReadAsync(buffer, cancellationToken, trace);
+        cancellationToken.ThrowIfCancellationRequested();
         if (bytesRead == 0)
         {
             trace.LogDecision("serial->socket relay stopped because the serial port returned EOF");
@@ -555,7 +611,7 @@ async Task ForwardSerialToSocket(WebSocket socket, ConnectionTrace trace, Cancel
         }
 
         trace.LogWebSocketSend("serial->socket", WebSocketMessageType.Binary, buffer.AsMemory(0, bytesRead), endOfMessage: true);
-        await socket.SendAsync(buffer.AsMemory(0, bytesRead), WebSocketMessageType.Binary, true, cancellationToken);
+        await socket.SendAsync(buffer.AsMemory(0, bytesRead), WebSocketMessageType.Binary, true, socketCancellationToken);
     }
 
     trace.LogDecision($"serial->socket relay stopped because websocket state became {socket.State}");
@@ -566,7 +622,18 @@ async Task CloseSocketIfNeeded(WebSocket socket, WebSocketCloseStatus closeStatu
     if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
     {
         trace.LogDecision($"sending close frame status={closeStatus} description='{statusDescription}' from state={socket.State}");
-        await socket.CloseAsync(closeStatus, statusDescription, cancellationToken);
+        var closeTask = socket.CloseAsync(closeStatus, statusDescription, cancellationToken);
+        try
+        {
+            await closeTask.WaitAsync(cancellationToken);
+        }
+        catch
+        {
+            socket.Abort();
+            try { await closeTask; }
+            catch { } // Preserve the failure that ended the close handshake.
+            throw;
+        }
         trace.LogDecision($"close frame sent; new websocket state={socket.State}");
     }
     else
@@ -575,12 +642,12 @@ async Task CloseSocketIfNeeded(WebSocket socket, WebSocketCloseStatus closeStatu
     }
 }
 
-async Task ReadExactlyFromWebSocket(WebSocket socket, Memory<byte> buffer, ConnectionTrace trace, string operation, CancellationToken cancellationToken)
+async Task ReadExactlyFromWebSocket(WebSocket socket, Memory<byte> buffer, ConnectionTrace trace, string operation, CancellationToken socketCancellationToken)
 {
     var offset = 0;
     while (offset < buffer.Length)
     {
-        var result = await socket.ReceiveAsync(buffer[offset..], cancellationToken);
+        var result = await socket.ReceiveAsync(buffer[offset..], socketCancellationToken);
         trace.LogWebSocketReceive(operation, result, buffer.Slice(offset, result.Count));
         if (result.MessageType == WebSocketMessageType.Close)
         {

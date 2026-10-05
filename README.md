@@ -25,6 +25,7 @@ The server currently processes requests sequentially. It is meant to be a small 
 
 - `Program.cs`: the server implementation, including HTTP handling, WebSocket protocol, Propeller boot-loader upload, serial proxy, and failure tracing.
 - `example/example.py`: a simple client that uploads a payload and enters a terminal session.
+- `p2aas-run/`: the .NET WebSocket upload and terminal client.
 - `example/payload.spin2`: example Propeller source.
 - `example/payload.bin`: example compiled payload used by the client.
 - `docs/p2boot.txt`: Propeller 2 boot-loader notes used as the protocol reference.
@@ -41,6 +42,7 @@ Server runtime:
 Optional tools:
 
 - Python 3 with the `websockets` package for `example/example.py`
+- `stty` for raw terminal input with `p2aas-run` on Unix
 - `just` if you want to use the helper recipes in `justfile`
 - `flexspin` and `loadp2` if you want to rebuild or load the example payload directly from the command line
 
@@ -51,6 +53,15 @@ Build the server from the repository root:
 ```bash
 dotnet build
 ```
+
+Build and run the .NET WebSocket client:
+
+```bash
+dotnet build p2aas-run/p2aas-run.csproj
+P2AAS_ENDPOINT=ws://127.0.0.1:12880/ dotnet run --project p2aas-run -- example/payload.bin
+```
+
+`dotnet run --project p2aas-run -- --help` lists the options. The client uploads the binary over the WebSocket, then forwards device output to stdout. Terminal input is sent character by character; piped stdin is sent as one chunk. Use `--no-interactive` for line-buffered terminal input, `--input TEXT` to send text before stdin, and `--baudrate` or `--timeout` to configure the server session. A normal server close, including its session timeout close, exits successfully.
 
 Publish a self-contained release build using the existing recipe:
 
