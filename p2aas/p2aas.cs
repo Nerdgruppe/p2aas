@@ -544,20 +544,23 @@ async Task LoadPayloadToDevice(ReadOnlyMemory<byte> payload, int userBaudRate, C
     var encodedPayload = Convert.ToBase64String(checksummedPayload);
     trace.LogDecision($"payload checksum appended; checksummedBytes={checksummedPayload.Length}; base64Bytes={encodedPayload.Length}");
 
-    await serialPort.WriteAsciiAsync("Prop_Txt 0 0 0 0 ", cancellationToken, trace);
+    // Build the complete command and write it with a single flush. Flushing after every
+    // chunk costs several ms each on USB serial adapters (tcdrain), which dominated upload time.
+    var command = new StringBuilder("Prop_Txt 0 0 0 0 ", encodedPayload.Length + encodedPayload.Length / SerialChunkSize * 3 + 32);
     for (var offset = 0; offset < encodedPayload.Length; offset += SerialChunkSize)
     {
         var chunkLength = Math.Min(SerialChunkSize, encodedPayload.Length - offset);
-        trace.LogDecision($"sending Prop_Txt chunk offset={offset} chunkBytes={chunkLength}");
-        await serialPort.WriteAsciiAsync(encodedPayload.Substring(offset, chunkLength), cancellationToken, trace);
+        command.Append(encodedPayload, offset, chunkLength);
 
         if (offset + chunkLength < encodedPayload.Length)
         {
-            await serialPort.WriteAsciiAsync("\r> ", cancellationToken, trace);
+            command.Append("\r> ");
         }
     }
+    command.Append(" ?\r");
 
-    await serialPort.WriteAsciiAsync(" ?\r", cancellationToken, trace);
+    trace.LogDecision($"sending Prop_Txt command in one write; bytes={command.Length}");
+    await serialPort.WriteAsciiAsync(command.ToString(), cancellationToken, trace);
 
     trace.LogDecision("waiting for Prop_Txt completion response byte");
     var response = await serialPort.ReadByteAsync(cancellationToken, trace);
